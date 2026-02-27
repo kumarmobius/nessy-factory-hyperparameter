@@ -1,0 +1,15 @@
+{
+    "learning_rate": 0.0005611516415334506,
+    "batch_size": 16,
+    "optimizer": "adam",
+    "weight_decay": 0.0003967605077052988,
+    "num_layers": 61,
+    "dropout": 0.15846100257813883,
+    "bidirectional": true,
+    "pooling": "last",
+    "learn_init_hidden": false,
+    "weight_init": "kaiming_uniform",
+    "loss_function": "maeloss",
+    "activation": "tanh",
+    "hidden_dims": "128,256,256,256,32,64,64,64,128,32,64,128,256,64,128,32,32,256,32,256,256,64,32,256,128,256,128,64,32,128,32,64,128,64,64,64,64,32,64,32,64,256,64,64,64,256,256,32,128,128,128,64,128,32,64,64,128,256,32,128,32"
+}

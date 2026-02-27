@@ -1,0 +1,866 @@
+name: Load & Preprocess
+description: |
+  Loads a dataset file (CSV/TSV/JSON/JSONL/Excel/Parquet/Feather/ORC) produced by the CDN Generic Downloader,
+  removes duplicates, drops rows with missing target, performs advanced alphanumeric numeric detection
+  & conversion, identifies datetime columns and extracts common date features, automatically chooses
+  per-column imputation/encoding/scaling strategies, removes outliers (optional), and saves:
+    - X (parquet)
+    - y (parquet)
+    - preprocessor (pickle) - fitted preprocessing object for inference
+    - preprocess_metadata (json) - decisions and diagnostics
+inputs:
+  - {name: in_file, type: Data, description: "Path to the downloaded file or directory (connect CDN Generic Downloader: out_file)"}
+  - {name: target_column, type: String, description: "Name of the target column in the dataset (rows with null target will be dropped)"}
+  - {name: outlier_strategy, type: String, description: "Outlier strategy: 'drop_iqr' or 'winsorize' or 'none'", optional: true, default: "drop_iqr"}
+  - {name: outlier_fold, type: Float, description: "IQR fold for outlier rule (e.g., 1.5)", optional: true, default: "1.5"}
+  - {name: max_knn_rows, type: Integer, description: "Max rows allowed to use KNN imputer (otherwise fall back)", optional: true, default: "5000"}
+  - {name: numeric_detection_threshold, type: Float, description: "Fraction (0-1) of parsable numeric values in object column to coerce to numeric", optional: true, default: "0.6"}
+  - {name: rare_threshold, type: Float, description: "Rare label threshold as fraction or absolute count (e.g. 0.01 or 10)", optional: true, default: "0.01"}
+  - {name: enable_string_similarity, type: String, description: "Use string similarity grouping for high-cardinality categoricals (true/false)", optional: true, default: "false"}
+  - {name: preview_rows, type: Integer, description: "Rows to include in preview JSON", optional: true, default: "20"}
+outputs:
+  - {name: X, type: Data, description: "Feature matrix (parquet) after preprocessing"}
+  - {name: y, type: Data, description: "Target column (parquet) after preprocessing"}
+  - {name: preprocessor, type: Data, description: "Pickle file with fitted preprocessor (for inference)"}
+  - {name: preprocess_metadata, type: Data, description: "JSON metadata describing chosen preprocessing steps"}
+implementation:
+  container:
+    image: python:3.10-slim
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse
+        import os
+        import sys
+        import argparse, os, sys, json, traceback, subprocess, re, io, gzip, zipfile, math
+        from datetime import datetime
+        from collections import Counter, defaultdict
+
+        # Install needed packages if missing
+        def pip_install(pkgs):
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-input"] + pkgs)
+
+        try:
+            import pandas as pd, numpy as np
+            from sklearn.impute import SimpleImputer, KNNImputer
+            from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler, PowerTransformer, OneHotEncoder, OrdinalEncoder
+            from sklearn.pipeline import Pipeline
+            from sklearn.model_selection import KFold
+            from sklearn.experimental import enable_iterative_imputer  # noqa
+            from sklearn.impute import IterativeImputer
+            import joblib
+            import category_encoders as ce
+            from rapidfuzz import process as rf_process, fuzz as rf_fuzz
+        except Exception:
+            pip_install(["pandas", "numpy", "scikit-learn", "joblib", "category_encoders", "rapidfuzz", "pyarrow", "fastparquet", "openpyxl"])
+            import pandas as pd, numpy as np
+            from sklearn.impute import SimpleImputer, KNNImputer
+            from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler, PowerTransformer, OneHotEncoder, OrdinalEncoder
+            from sklearn.pipeline import Pipeline
+            from sklearn.model_selection import KFold
+            from sklearn.experimental import enable_iterative_imputer  # noqa
+            from sklearn.impute import IterativeImputer
+            import joblib
+            import category_encoders as ce
+            from rapidfuzz import process as rf_process, fuzz as rf_fuzz
+
+        # -------------- Robust file loader (handles dir/gz/zip/sniff) --------------
+        def sample_file_bytes(path, n=8192):
+            try:
+                with open(path, "rb") as fh:
+                    return fh.read(n)
+            except Exception:
+                return b""
+
+        # a
+        def is_likely_json(sample_bytes):
+            if not sample_bytes:
+                return False
+            try:
+                txt = sample_bytes.decode("utf-8", errors="ignore").lstrip()
+            except Exception:
+                return False
+            if not txt:
+                return False
+        
+            # use chr() to avoid embedding literal { or [ in YAML
+            open_brace = chr(123)   # '{'
+            open_bracket = chr(91)  # '['
+            newline = chr(10)
+        
+            first_char = txt[0]
+            if first_char == open_brace or first_char == open_bracket:
+                return True
+        
+            if (newline + open_brace) in txt or (newline + open_bracket) in txt:
+                return True
+        
+            return False
+
+
+        def read_with_pandas(path):
+            # If directory, pick largest/only file
+            if os.path.isdir(path):
+                entries = [os.path.join(path, f) for f in os.listdir(path) if not f.startswith(".")]
+                if not entries:
+                    raise ValueError("Input directory is empty: " + path)
+                files = [p for p in entries if os.path.isfile(p)]
+                if not files:
+                    raise ValueError("No regular files inside directory: " + path)
+                path = files[0] if len(files) == 1 else max(files, key=lambda p: os.path.getsize(p))
+                print("Info: in_file was directory, selected:", path)
+
+            if not os.path.exists(path) or not os.path.isfile(path):
+                raise ValueError("Input path not found or not a file: " + path)
+
+            ext = os.path.splitext(path)[1].lower()
+
+            # gz
+            if ext == ".gz" or path.endswith(".csv.gz") or path.endswith(".json.gz"):
+                try:
+                    with gzip.open(path, "rt", encoding="utf-8", errors="ignore") as fh:
+                        sample = fh.read(8192)
+                        fh.seek(0)
+                        if is_likely_json(sample.encode() if isinstance(sample,str) else sample):
+                            fh.seek(0)
+                            try:
+                                return pd.read_json(fh, lines=True)
+                            except Exception:
+                                fh.seek(0)
+                                return pd.read_csv(fh)
+                        fh.seek(0)
+                        return pd.read_csv(fh)
+                except Exception:
+                    pass
+
+            # zip
+            if ext == ".zip":
+                with zipfile.ZipFile(path, "r") as z:
+                    members = [n for n in z.namelist() if not n.endswith("/")]
+                    if not members:
+                        raise ValueError("Zip archive empty: " + path)
+                    member = max(members, key=lambda n: z.getinfo(n).file_size if z.getinfo(n).file_size else 0)
+                    with z.open(member) as fh:
+                        sample = fh.read(8192)
+                        if is_likely_json(sample):
+                            with z.open(member) as fh2:
+                                return pd.read_json(io.TextIOWrapper(fh2, encoding="utf-8"), lines=True)
+                        else:
+                            with z.open(member) as fh2:
+                                return pd.read_csv(io.TextIOWrapper(fh2, encoding="utf-8"))
+
+            # extension quick attempts
+            try:
+                if ext == ".csv":
+                    return pd.read_csv(path)
+                if ext in (".tsv", ".tab"):
+                    return pd.read_csv(path, sep="\t")
+                if ext in (".json", ".ndjson", ".jsonl"):
+                    try:
+                        return pd.read_json(path, lines=True)
+                    except ValueError:
+                        return pd.read_json(path)
+                if ext in (".xls", ".xlsx"):
+                    return pd.read_excel(path)
+                if ext in (".parquet", ".pq"):
+                    return pd.read_parquet(path, engine="auto")
+                if ext == ".feather":
+                    return pd.read_feather(path)
+                if ext == ".orc":
+                    return pd.read_orc(path)
+            except Exception:
+                pass
+
+            # sniff parquet
+            try:
+                return pd.read_parquet(path, engine="auto")
+            except Exception:
+                pass
+
+            # sample-based sniff
+            sample = sample_file_bytes(path)
+            if is_likely_json(sample):
+                try:
+                    return pd.read_json(path, lines=True)
+                except Exception:
+                    pass
+            try:
+                return pd.read_csv(path)
+            except Exception:
+                pass
+
+            raise ValueError("Unsupported or unreadable file format: " + path)
+
+        # -------------- Advanced alphanumeric parsing -----------------------------
+        CURRENCY_SYMBOLS_REGEX = r'[€£¥₹$¢฿₪₩₫₽₺]'
+        MULTIPLIER_MAP = {'k':1e3, 'm':1e6, 'b':1e9, 't':1e12}
+        TOKEN_RE = re.compile(
+            r'^\s*'
+            r'(?P<sign>[-+]?)'
+            r'(?P<number>(?:\d{1,3}(?:[,\s]\d{3})+|\d+)(?:[.,]\d+)?)'
+            r'\s*'
+            r'(?P<mult>[kKmMbBtT])?'
+            r'\s*(?P<unit>[A-Za-z%/°µμ²³]*)\s*$'
+        )
+
+        def parse_alphanumeric_to_numeric(s, decimal_comma=False):
+            if pd.isna(s):
+                return np.nan
+            orig = str(s).strip()
+            if orig == '' or orig.lower() in {'nan','none','null','na'}:
+                return np.nan
+            tmp = re.sub(CURRENCY_SYMBOLS_REGEX, '', orig)
+            # percent
+            if tmp.strip().endswith('%'):
+                try:
+                    num = float(tmp.strip().rstrip('%').replace(',', '').replace(' ', ''))
+                    return num / 100.0
+                except Exception:
+                    pass
+            tmp = tmp.replace('\u2212', '-').replace('\u2013', '-').replace('\u2014', '-')
+            tmp = re.sub(r'[\u00A0\u202F]', '', tmp).strip()
+            if decimal_comma:
+                tmp = tmp.replace('.', '').replace(',', '.')
+            else:
+                tmp = tmp.replace(',', '').replace(' ', '')
+            try:
+                return float(tmp)
+            except Exception:
+                pass
+            m = TOKEN_RE.match(tmp)
+            if m:
+                number = m.group('number')
+                mult = m.group('mult')
+                unit = (m.group('unit') or '').lower()
+                number_clean = number.replace(',', '').replace(' ', '')
+                try:
+                    val = float(number_clean)
+                except Exception:
+                    try:
+                        val = float(number_clean.replace(',', '.'))
+                    except Exception:
+                        return np.nan
+                if mult:
+                    val *= MULTIPLIER_MAP.get(mult.lower(), 1.0)
+                if unit and '%' in unit:
+                    val = val / 100.0
+                return val
+            num_search = re.search(r'[-+]?\d+([.,]\d+)?', tmp)
+            if num_search:
+                try:
+                    candidate = num_search.group(0).replace(',', '')
+                    return float(candidate)
+                except Exception:
+                    return np.nan
+            return np.nan
+
+        def convert_object_columns_advanced(df, detect_threshold=0.6, decimal_comma=False, advanced=True):
+            df = df.copy()
+            report = {'converted': [], 'skipped': []}
+            obj_cols = [c for c in df.columns if (df[c].dtype == 'object' or str(df[c].dtype).startswith('string'))]
+            for col in obj_cols:
+                ser = df[col].astype(object)
+                total_non_null = ser.notna().sum()
+                if total_non_null == 0:
+                    report['skipped'].append(col); continue
+                if advanced:
+                    parsed = ser.map(lambda x: parse_alphanumeric_to_numeric(x, decimal_comma=decimal_comma))
+                else:
+                    parsed = pd.to_numeric(ser, errors='coerce')
+                parsable = parsed.notna().sum()
+                frac = parsable / float(total_non_null)
+                if frac >= detect_threshold:
+                    df[col + "_orig"] = df[col]
+                    df[col] = parsed
+                    report['converted'].append({'col': col, 'parsable_fraction': frac})
+                else:
+                    report['skipped'].append({'col': col, 'parsable_fraction': frac})
+            return df, report
+
+        # ---------------- Date detection & extraction -----------------------------
+        def detect_and_extract_dates(df, date_parse_enabled=True):
+            df = df.copy()
+            report = {'date_columns': [], 'skipped': []}
+            if not date_parse_enabled:
+                return df, report
+            candidate_cols = [c for c in df.columns if (df[c].dtype == 'object' or str(df[c].dtype).startswith('string'))]
+            for col in candidate_cols:
+                ser = df[col].astype(object)
+                sample = ser.dropna().astype(str).head(500)
+                if sample.empty:
+                    report['skipped'].append(col); continue
+                parsed = pd.to_datetime(sample, errors='coerce', infer_datetime_format=True, utc=False)
+                parsable_frac = parsed.notna().mean()
+                if parsable_frac >= 0.6:
+                    full_parsed = pd.to_datetime(ser, errors='coerce', infer_datetime_format=True, utc=False)
+                    df[col + "_orig"] = df[col]
+                    df[col] = full_parsed
+                    # extract features
+                    df[col + "_year"] = df[col].dt.year
+                    df[col + "_month"] = df[col].dt.month
+                    df[col + "_day"] = df[col].dt.day
+                    df[col + "_dayofweek"] = df[col].dt.dayofweek
+                    df[col + "_is_weekend"] = df[col].dt.dayofweek.isin([5,6]).astype('Int64')
+                    df[col + "_is_month_start"] = df[col].dt.is_month_start.astype('Int64')
+                    df[col + "_is_month_end"] = df[col].dt.is_month_end.astype('Int64')
+                    df[col + "_days_since_epoch"] = (df[col] - pd.Timestamp("1970-01-01")) // pd.Timedelta('1D')
+                    report['date_columns'].append({'col': col, 'parsable_fraction': parsable_frac})
+                else:
+                    report['skipped'].append({'col': col, 'parsable_fraction': parsable_frac})
+            return df, report
+
+        # ----------------- Rare label & string similarity helpers -----------------
+        def collapse_rare_labels(series, threshold_frac=0.01, threshold_count=None):
+            counts = series.value_counts(dropna=False)
+            n = len(series)
+            if threshold_count is not None:
+                rare = set(counts[counts <= threshold_count].index)
+            else:
+                rare = set(counts[counts <= max(1, int(threshold_frac * n))].index)
+            return series.map(lambda x: "__RARE__" if x in rare else x), rare
+
+        def string_similarity_group(series, score_threshold=90):
+            # greedily cluster unique values by similarity using rapidfuzz
+            vals = [v for v in pd.Series(series.dropna().unique()).astype(str)]
+            mapping = {}
+            used = set()
+            for v in vals:
+                if v in used: continue
+                matches = rf_process.extract(v, vals, scorer=rf_fuzz.token_sort_ratio, score_cutoff=score_threshold)
+                # matches: list of (match,score,idx)
+                group = [m[0] for m in matches]
+                for g in group:
+                    mapping[g] = v
+                    used.add(g)
+            return pd.Series(series).astype(object).map(lambda x: mapping.get(str(x), x)), mapping
+
+        # ----------------- Outlier handling --------------------------------------
+        def drop_outliers_iqr(df, numeric_cols, fold=1.5):
+            if not numeric_cols:
+                return df, 0
+            q1 = df[numeric_cols].quantile(0.25)
+            q3 = df[numeric_cols].quantile(0.75)
+            iqr = q3 - q1
+            lower = q1 - fold * iqr
+            upper = q3 + fold * iqr
+            mask = pd.Series(True, index=df.index)
+            for c in numeric_cols:
+                mask &= df[c].ge(lower[c]) & df[c].le(upper[c])
+            before = len(df)
+            df2 = df.loc[mask].reset_index(drop=True)
+            return df2, before - len(df2)
+
+        def winsorize_df(df, numeric_cols, fold=1.5):
+            if not numeric_cols:
+                return df, 0
+            q1 = df[numeric_cols].quantile(0.25)
+            q3 = df[numeric_cols].quantile(0.75)
+            iqr = q3 - q1
+            lower = q1 - fold * iqr
+            upper = q3 + fold * iqr
+            df2 = df.copy()
+            for c in numeric_cols:
+                df2[c] = df2[c].clip(lower=lower[c], upper=upper[c])
+            return df2, 0
+
+        # ----------------- Scaler selection --------------------------------------
+        def choose_scaler_for_series(s):
+            # input: pandas Series numeric (no NaNs)
+            # compute skewness & outlier measure
+            v = s.dropna()
+            if v.empty:
+                return StandardScaler()  # default
+            skew = float(v.skew())
+            kurt = float(v.kurtosis()) if len(v) > 3 else 0.0
+            # proportion of extreme values beyond 3*std
+            if v.std(ddof=0) == 0:
+                return StandardScaler()
+            extreme_frac = float(((v - v.mean()).abs() > 3 * v.std(ddof=0)).mean())
+            # if bounded 0..1
+            if (v.min() >= 0.0 and v.max() <= 1.0):
+                return MinMaxScaler()
+            if abs(skew) >= 1.0:
+                # use power transformer then standardize
+                return Pipeline([('power', PowerTransformer(method='yeo-johnson')), ('std', StandardScaler())])
+            if extreme_frac > 0.01 or abs(kurt) > 10:
+                return RobustScaler()
+            # default
+            return StandardScaler()
+
+        # ----------------- Categorical encoder chooser ---------------------------
+        def choose_categorical_encoder(col, series, target_series=None, train_mode=True):
+            # returns tuple (encoder_name, encoder_obj, encoder_args)
+            n = len(series)
+            nunique = series.nunique(dropna=True)
+            missing_frac = series.isna().mean()
+            top_freq = series.value_counts(normalize=True, dropna=True).iloc[0] if nunique>0 else 1.0
+            high_card = (nunique > max(50, 0.05 * n))
+            # Rare label collapse recommended first
+            # Choose encoder:
+            if high_card:
+                # prefer TargetEncoder if target present and training; else Count/Freq encoder
+                if target_series is not None and train_mode:
+                    enc = ce.TargetEncoder(cols=[col], smoothing=0.3)
+                    return 'target', enc, {}
+                else:
+                    # count/freq
+                    def freq_map(s):
+                        c = s.value_counts()
+                        return s.map(c.to_dict())
+                    return 'count', None, {}
+            else:
+                # low-cardinality
+                if nunique <= 10:
+                    # OneHot good
+                    enc = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+                    return 'onehot', enc, {}
+                # medium card
+                if target_series is not None and train_mode:
+                    enc = ce.TargetEncoder(cols=[col], smoothing=0.3)
+                    return 'target', enc, {}
+                else:
+                    # ordinal fallback
+                    enc = OrdinalEncoder()
+                    return 'ordinal', enc, {}
+
+        # ----------------- Target-aware encoders: safe K-fold target encoding ----
+        def fit_target_encoder_kfold(df, col, y, n_splits=5, smoothing=0.3, random_state=42):
+            # Returns mapping dict to mean-encoded values + global mean
+            # K-fold out-of-fold target encoding to avoid leakage
+            X_col = df[col].astype(object).fillna('__NA__')
+            global_mean = y.mean()
+            oof = pd.Series(index=df.index, dtype=float)
+            kf = KFold(n_splits=min(n_splits, max(2, len(df)//10)), shuffle=True, random_state=random_state)
+            for tr_idx, val_idx in kf.split(df):
+                grp = X_col.iloc[tr_idx].map(lambda x: x)
+                means = y.iloc[tr_idx].groupby(X_col.iloc[tr_idx]).mean()
+                oof.iloc[val_idx] = X_col.iloc[val_idx].map(lambda v: means.get(v, global_mean))
+            # smoothing: blend per category count with global mean
+            counts = X_col.value_counts()
+            smooth_map = {}
+            for cat, cnt in counts.items():
+                cat_mean = y[X_col==cat].mean() if cnt>0 else global_mean
+                # smoothed value
+                alpha = cnt / (cnt + smoothing)
+                smooth_map[cat] = alpha * cat_mean + (1 - alpha) * global_mean
+            return oof.fillna(global_mean), smooth_map, global_mean
+
+        # ----------------- Preprocessor object saved for inference ----------------
+        class Preprocessor:
+            def __init__(self):
+                # store per-column pipeline objects & mappings
+                self.num_cols = []
+                self.cat_cols = []
+                self.col_config = {}  # col -> dict with imputer/scaler/encoder etc.
+                self.global_metadata = {}
+            def fit(self, df, y=None, config=None):
+                # config contains thresholds and flags (populated by main)
+                self.global_metadata['config'] = config or {}
+                nrows = len(df)
+                # detect cols
+                self.num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+                self.cat_cols = [c for c in df.columns if c not in self.num_cols]
+                # Fit per numeric column
+                for c in self.num_cols:
+                    s = df[c]
+                    cfg = {}
+                    missing_frac = s.isna().mean()
+                    cfg['missing_frac'] = float(missing_frac)
+                    cfg['n_unique'] = int(s.nunique(dropna=True))
+                    cfg['skew'] = float(s.dropna().skew()) if s.dropna().shape[0]>2 else 0.0
+                    cfg['kurtosis'] = float(s.dropna().kurtosis()) if s.dropna().shape[0]>3 else 0.0
+                    # choose imputer
+                    if missing_frac == 0:
+                        cfg['imputer'] = ('none', None)
+                    elif missing_frac < 0.02:
+                        imp = SimpleImputer(strategy='median')
+                        imp.fit(np.array(s).reshape(-1,1))
+                        cfg['imputer'] = ('simple_median', imp)
+                    else:
+                        # prefer KNN if small dataset and fraction moderate
+                        if nrows <= config.get('max_knn_rows', 5000) and missing_frac < 0.25:
+                            cfg['imputer'] = ('knn', {'n_neighbors':5})
+                        else:
+                            cfg['imputer'] = ('iterative', {'max_iter':10, 'random_state':0})
+                    # choose scaler (fit later after imputation)
+                    cfg['scaler_choice'] = 'auto'
+                    self.col_config[c] = cfg
+                # Fit per categorical column
+                for c in self.cat_cols:
+                    s = df[c].astype(object)
+                    cfg = {}
+                    cfg['n_unique'] = int(s.nunique(dropna=True))
+                    cfg['missing_frac'] = float(s.isna().mean())
+                    cfg['high_card'] = cfg['n_unique'] > max(50, 0.05 * nrows)
+                    # Rare collapse threshold
+                    cfg['rare_threshold_frac'] = config.get('rare_threshold', 0.01)
+                    # Choose encoder
+                    enc_name, enc_obj, enc_args = choose_categorical_encoder(c, s, (y if y is not None else None), train_mode=(y is not None))
+                    cfg['encoder_type'] = enc_name
+                    cfg['encoder_obj'] = enc_obj  # sklearn / ce objects or None for count
+                    self.col_config[c] = cfg
+                # Fit target-based encoders if present
+                if y is not None:
+                    for c in self.cat_cols:
+                        cfg = self.col_config[c]
+                        if cfg['encoder_type'] == 'target':
+                            # use kfold target encoding with smoothing
+                            _, mapping, global_mean = fit_target_encoder_kfold(df, c, y, n_splits=5)
+                            cfg['target_mapping'] = mapping
+                            cfg['target_global_mean'] = float(global_mean)
+                        elif cfg['encoder_type'] == 'count':
+                            counts = df[c].astype(object).value_counts().to_dict()
+                            cfg['count_map'] = counts
+                # store numeric col order
+                self.global_metadata['num_cols'] = self.num_cols
+                self.global_metadata['cat_cols'] = self.cat_cols
+                return self
+
+            def transform(self, df, training_mode=False):
+                df = df.copy()
+                # apply numeric imputers and scalers per the config
+                # first, handle numeric columns: create working copy
+                # We'll perform a two-stage approach for KNN/Iterative: temporary simple -> scaling -> impute -> inverse
+                # Step A: temporary simple fill for columns that need KNN/Iterative
+                temp_df = df.copy()
+                temp_filled_cols = []
+                for c in self.num_cols:
+                    cfg = self.col_config.get(c, {})
+                    imputer_info = cfg.get('imputer', ('none', None))
+                    if imputer_info[0] in ('knn','iterative'):
+                        # temp median fill
+                        med = temp_df[c].median()
+                        temp_df[c] = temp_df[c].fillna(med)
+                        temp_filled_cols.append(c)
+                # Step B: choose scalers for numeric columns using temp_filled data
+                scaler_objs = {}
+                for c in self.num_cols:
+                    sample = temp_df[c]
+                    scaler = choose_scaler_for_series(sample)
+                    # fit scaler on temp_filled data
+                    try:
+                        if isinstance(scaler, Pipeline):
+                            scaler.fit(sample.values.reshape(-1,1))
+                        else:
+                            scaler.fit(sample.values.reshape(-1,1))
+                    except Exception:
+                        # fallback
+                        scaler = StandardScaler()
+                        scaler.fit(sample.values.reshape(-1,1))
+                    scaler_objs[c] = scaler
+                    self.col_config[c]['scaler_obj'] = scaler
+                # Step C: apply KNN/Iterative using scaled values for relevant cols
+                # Build matrix for numeric columns
+                num_matrix = temp_df[self.num_cols].copy()
+                # scale each column independently (so KNN distance is balanced)
+                scaled_matrix = np.zeros_like(num_matrix.values, dtype=float)
+                for i, c in enumerate(self.num_cols):
+                    sc = scaler_objs[c]
+                    col_vals = num_matrix[c].values.reshape(-1,1)
+                    try:
+                        scaled_col = sc.transform(col_vals).reshape(-1)
+                    except Exception:
+                        scaled_col = StandardScaler().fit_transform(col_vals).reshape(-1)
+                    scaled_matrix[:, i] = scaled_col
+                scaled_df = pd.DataFrame(scaled_matrix, columns=self.num_cols, index=num_matrix.index)
+                # For columns requiring knn/iterative, apply
+                # KNN on scaled space (only numeric columns are used)
+                # We'll apply KNN imputation columnwise using sklearn KNNImputer on whole scaled_df
+                # Identify columns that need KNN
+                need_knn = [c for c in self.num_cols if self.col_config[c]['imputer'][0]=='knn']
+                if need_knn:
+                    knn = KNNImputer(n_neighbors= self.col_config[self.num_cols[0]]['imputer'][1].get('n_neighbors',5) if isinstance(self.col_config[self.num_cols[0]]['imputer'], tuple) and self.col_config[self.num_cols[0]]['imputer'][0]=='knn' else 5)
+                    imputed_scaled = knn.fit_transform(scaled_df)
+                    imputed_scaled_df = pd.DataFrame(imputed_scaled, columns=self.num_cols, index=scaled_df.index)
+                    # inverse transform back into original units for all numeric columns
+                    for c in self.num_cols:
+                        sc = scaler_objs[c]
+                        try:
+                            inv = sc.inverse_transform(imputed_scaled_df[c].values.reshape(-1,1)).reshape(-1)
+                        except Exception:
+                            inv = sc.fit_transform(imputed_scaled_df[c].values.reshape(-1,1)).reshape(-1)
+                        df[c] = inv
+                # For iterative imputer, apply on original numeric matrix (after simple temp fill and scaling)
+                need_iter = [c for c in self.num_cols if self.col_config[c]['imputer'][0]=='iterative']
+                if need_iter:
+                    # apply iterative imputer on original numeric columns (fit on temp-filled matrix)
+                    iter_imp = IterativeImputer(max_iter=self.col_config[self.num_cols[0]]['imputer'][1].get('max_iter',10), random_state=0)
+                    iter_out = iter_imp.fit_transform(df[self.num_cols])
+                    df[self.num_cols] = pd.DataFrame(iter_out, columns=self.num_cols, index=df.index)
+                    # store imputer object for future use
+                    for c in need_iter:
+                        self.col_config[c]['imputer_obj'] = iter_imp
+                # Apply simple imputers for remaining columns
+                for c in self.num_cols:
+                    cfg = self.col_config[c]
+                    if cfg['imputer'][0] == 'simple_median':
+                        imp = cfg['imputer'][1]
+                        df[c] = imp.transform(df[[c]])
+                    elif cfg['imputer'][0] == 'none':
+                        pass
+                    elif cfg['imputer'][0] == 'knn':
+                        # already handled via KNN imputed whole numeric block above if need_knn present
+                        pass
+                    # iterative already handled
+                # After imputation, optionally do outlier handling (global)
+                if self.global_metadata['config'].get('outlier_strategy','drop_iqr') == 'drop_iqr':
+                    df, n_removed = drop_outliers_iqr(df, self.num_cols, fold=self.global_metadata['config'].get('outlier_fold',1.5))
+                    self.global_metadata['outliers_removed'] = int(n_removed)
+                elif self.global_metadata['config'].get('outlier_strategy') == 'winsorize':
+                    df, _ = winsorize_df(df, self.num_cols, fold=self.global_metadata['config'].get('outlier_fold',1.5))
+                # Fit/apply scalers finally (on imputed data)
+                for c in self.num_cols:
+                    sc = self.col_config[c].get('scaler_obj')
+                    if sc is None:
+                        sc = choose_scaler_for_series(df[c].fillna(df[c].median()))
+                    try:
+                        transformed = sc.transform(df[[c]].values)
+                        df[c] = transformed.reshape(-1)
+                    except Exception:
+                        # if scaler is a Pipeline with PowerTransformer + StandardScaler
+                        try:
+                            df[c] = sc.fit_transform(df[[c]].values).reshape(-1)
+                        except Exception:
+                            # fallback: standard scale manually
+                            df[c] = StandardScaler().fit_transform(df[[c]].fillna(df[c].median()).values).reshape(-1)
+                    # save scaler for inference
+                    self.col_config[c]['scaler_obj'] = sc
+                # Categorical columns: apply RareLabel + encoders
+                for c in self.cat_cols:
+                    cfg = self.col_config[c]
+                    s = df[c].astype(object)
+                    # rare label collapse
+                    rare_thresh = cfg.get('rare_threshold_frac', 0.01)
+                    # If value is fraction between 0 and 1, interpret as fraction else treat as count if >=1
+                    if rare_thresh < 1.0:
+                        collapsed, rare_set = collapse_rare_labels(s, threshold_frac=rare_thresh, threshold_count=None)
+                    else:
+                        collapsed, rare_set = collapse_rare_labels(s, threshold_frac=0.01, threshold_count=int(rare_thresh))
+                    df[c] = collapsed
+                    cfg['rare_values'] = list(rare_set)
+                    # optional string similarity grouping (only if enabled)
+                    if self.global_metadata['config'].get('enable_string_similarity', False) and cfg['n_unique'] > 20:
+                        grouped, mapping = string_similarity_group(df[c], score_threshold=90)
+                        df[c] = grouped
+                        cfg['string_similarity_map'] = mapping
+                    # now encoder
+                    enc_type = cfg.get('encoder_type')
+                    if enc_type == 'onehot':
+                        # fit OneHotEncoder on column and produce new columns
+                        ohe = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+                        resh = df[[c]].astype(str)
+                        ohe.fit(resh)
+                        arr = ohe.transform(resh)
+                        cols = [f"{c}__{cat}" for cat in ohe.categories_[0]]
+                        df_ohe = pd.DataFrame(arr, columns=cols, index=df.index)
+                        # drop original and concat
+                        df = pd.concat([df.drop(columns=[c]), df_ohe], axis=1)
+                        cfg['encoder_obj'] = ohe
+                        cfg['ohe_columns'] = cols
+                    elif enc_type == 'ordinal':
+                        ord_enc = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
+                        resh = df[[c]].astype(object)
+                        try:
+                            ord_enc.fit(resh)
+                            df[c] = ord_enc.transform(resh).astype(float)
+                            cfg['encoder_obj'] = ord_enc
+                        except Exception:
+                            df[c] = df[c].astype('category').cat.codes.astype(float)
+                    elif enc_type == 'count':
+                        cnt_map = df[c].value_counts().to_dict()
+                        df[c] = df[c].map(lambda x: cnt_map.get(x, 0))
+                        cfg['count_map'] = cnt_map
+                    elif enc_type == 'target':
+                        # use mapping produced in fit
+                        mapping = cfg.get('target_mapping', {})
+                        global_mean = cfg.get('target_global_mean', 0.0)
+                        df[c] = df[c].map(lambda x: mapping.get(x, global_mean))
+                    else:
+                        # fallback: label encode
+                        df[c] = df[c].astype('category').cat.codes.replace({-1: np.nan}).astype(float)
+                # finished transformations
+                return df
+
+            def save(self, path):
+                joblib.dump(self, path)
+
+            @staticmethod
+            def load(path):
+                return joblib.load(path)
+
+        # ----------------- Main execution starts here ---------------------------
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--in_file', type=str, required=True)
+        parser.add_argument('--target_column', type=str, required=True)
+        parser.add_argument('--outlier_strategy', type=str, default="drop_iqr")
+        parser.add_argument('--outlier_fold', type=float, default=1.5)
+        parser.add_argument('--max_knn_rows', type=int, default=5000)
+        parser.add_argument('--numeric_detection_threshold', type=float, default=0.6)
+        parser.add_argument('--rare_threshold', type=float, default=0.01)
+        parser.add_argument('--enable_string_similarity', type=str, default="false")
+        parser.add_argument('--preview_rows', type=int, default=20)
+        parser.add_argument('--X', type=str, required=True)
+        parser.add_argument('--y', type=str, required=True)
+        parser.add_argument('--preprocessor', type=str, required=True)
+        parser.add_argument('--preprocess_metadata', type=str, required=True)
+        args = parser.parse_args()
+
+        try:
+            in_path = args.in_file
+            target_col = args.target_column
+            outlier_strategy = args.outlier_strategy
+            outlier_fold = float(args.outlier_fold)
+            max_knn_rows = int(args.max_knn_rows)
+            detect_thresh = float(args.numeric_detection_threshold)
+            rare_threshold = float(args.rare_threshold)
+            enable_string_similarity = str(args.enable_string_similarity).lower() in ("1","true","t","yes","y")
+            preview_rows = int(args.preview_rows)
+            out_X = args.X
+            out_y = args.y
+            preproc_path = args.preprocessor
+            meta_path = args.preprocess_metadata
+
+            if not os.path.exists(in_path):
+                print("ERROR: input file does not exist:", in_path, file=sys.stderr)
+                sys.exit(1)
+            print("Loading:", in_path)
+            df = read_with_pandas(in_path)
+            print("Loaded shape:", df.shape)
+
+            # basic cleaning
+            before = len(df)
+            df = df.drop_duplicates(keep='first')
+            print(f"Removed duplicates: {before - len(df)} rows dropped")
+
+            if target_col not in df.columns:
+                print(f"ERROR: target column '{target_col}' not found in data", file=sys.stderr)
+                sys.exit(1)
+            before = len(df)
+            df = df[df[target_col].notna()].reset_index(drop=True)
+            print(f"Dropped rows with null target '{target_col}': {before - len(df)} rows dropped")
+
+            # advanced alphanumeric conversion
+            print("Converting object columns to numeric where possible...")
+            df, conv_report = convert_object_columns_advanced(df, detect_threshold=detect_thresh, decimal_comma=False, advanced=True)
+            print("Conversion report:", json.dumps(conv_report, default=str)[:1000])
+
+            # detect dates and extract features
+            print("Detecting date-like columns...")
+            df, date_report = detect_and_extract_dates(df, date_parse_enabled=True)
+            print("Date parse report:", json.dumps(date_report, default=str)[:1000])
+
+            # prepare preprocessor config
+            config = {
+                'outlier_strategy': outlier_strategy,
+                'outlier_fold': outlier_fold,
+                'max_knn_rows': max_knn_rows,
+                'numeric_detection_threshold': detect_thresh,
+                'rare_threshold': rare_threshold,
+                'enable_string_similarity': enable_string_similarity
+            }
+
+            # build and fit preprocessor
+            pre = Preprocessor()
+            y_ser = df[[target_col]].copy()
+            X_df_init = df.drop(columns=[target_col]).copy()
+            pre.fit(X_df_init, y=y_ser[target_col] if not y_ser.empty else None, config=config)
+
+            # transform data
+            print("Applying fitted preprocessing pipeline (imputation/encoding/scaling)...")
+            X_processed = pre.transform(X_df_init, training_mode=True)
+
+            # Convert any remaining non-numeric columns to numeric where possible (safe)
+            # and ensure no object dtype remains except for rare cases
+            for c in list(X_processed.columns):
+                if X_processed[c].dtype == 'object':
+                    try:
+                        X_processed[c] = pd.to_numeric(X_processed[c], errors='coerce')
+                    except Exception:
+                        pass
+
+            # optimize numeric dtype
+            print("Optimizing numeric dtypes...")
+            # downcast numeric columns
+            for col in X_processed.select_dtypes(include=[np.number]).columns:
+                col_min = X_processed[col].min(skipna=True)
+                col_max = X_processed[col].max(skipna=True)
+                if pd.api.types.is_integer_dtype(X_processed[col].dtype) or np.allclose(X_processed[col].dropna(), np.round(X_processed[col].dropna())):
+                    # integer-like
+                    try:
+                        if col_min >= np.iinfo(np.int8).min and col_max <= np.iinfo(np.int8).max:
+                            X_processed[col] = X_processed[col].astype('Int8')
+                        elif col_min >= np.iinfo(np.int16).min and col_max <= np.iinfo(np.int16).max:
+                            X_processed[col] = X_processed[col].astype('Int16')
+                        elif col_min >= np.iinfo(np.int32).min and col_max <= np.iinfo(np.int32).max:
+                            X_processed[col] = X_processed[col].astype('Int32')
+                        else:
+                            X_processed[col] = X_processed[col].astype('Int64')
+                    except Exception:
+                        X_processed[col] = pd.to_numeric(X_processed[col], downcast='float')
+                else:
+                    X_processed[col] = pd.to_numeric(X_processed[col], downcast='float')
+
+            # Save outputs
+            def makedirs_for(p):
+                d = os.path.dirname(p)
+                if d and not os.path.exists(d):
+                    os.makedirs(d, exist_ok=True)
+            makedirs_for(out_X); makedirs_for(out_y); makedirs_for(preproc_path); makedirs_for(meta_path)
+
+            X_processed.to_parquet(out_X, index=False)
+            print("Wrote X parquet:", out_X)
+
+            y_ser.to_parquet(out_y, index=False)
+            print("Wrote y parquet:", out_y)
+
+            # Save preprocessor and metadata
+            pre.save(preproc_path)
+            print("Saved preprocessor pickle:", preproc_path)
+
+            metadata = {
+                'timestamp': datetime.utcnow().isoformat() + 'Z',
+                'config': config,
+                'conversion_report': conv_report,
+                'date_report': date_report,
+                'col_config': {k: {kk:v for kk,v in ( (kk, (str(v) if not hasattr(v,'__name__') else v.__name__)) for kk,v in cfg.items() )} for k,cfg in pre.col_config.items() for k in [k]},
+                'num_cols': pre.global_metadata.get('num_cols', []),
+                'cat_cols': pre.global_metadata.get('cat_cols', [])
+            }
+            with open(meta_path, 'w', encoding='utf-8') as fh:
+                json.dump(metadata, fh, indent=2, ensure_ascii=False)
+            print("Saved preprocess metadata:", meta_path)
+
+            print("SUCCESS: Preprocessing complete.")
+        except Exception as exc:
+            print("ERROR during preprocessing:", exc, file=sys.stderr)
+            traceback.print_exc()
+            sys.exit(1)
+    args:
+      - --in_file
+      - {inputPath: in_file}
+      - --target_column
+      - {inputValue: target_column}
+      - --outlier_strategy
+      - {inputValue: outlier_strategy}
+      - --outlier_fold
+      - {inputValue: outlier_fold}
+      - --max_knn_rows
+      - {inputValue: max_knn_rows}
+      - --numeric_detection_threshold
+      - {inputValue: numeric_detection_threshold}
+      - --rare_threshold
+      - {inputValue: rare_threshold}
+      - --enable_string_similarity
+      - {inputValue: enable_string_similarity}
+      - --preview_rows
+      - {inputValue: preview_rows}
+      - --X
+      - {outputPath: X}
+      - --y
+      - {outputPath: y}
+      - --preprocessor
+      - {outputPath: preprocessor}
+      - --preprocess_metadata
+      - {outputPath: preprocess_metadata}

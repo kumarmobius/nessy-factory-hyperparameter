@@ -1,0 +1,17 @@
+{
+    "optimizer": "adamax",
+    "latent_dim": 24,
+    "encoder_activation": "elu",
+    "output_activation": "tanh",
+    "weight_init": "normal",
+    "reconstruction_loss": "bce",
+    "decoder_activation": "gelu",
+    "encoder_batch_norm": false,
+    "decoder_batch_norm": true,
+    "encoder_dropout": 0.030857249330201505,
+    "decoder_dropout": 0.3533886084427229,
+    "learning_rate": 0.0002158160878940562,
+    "batch_size": 526,
+    "encoder_layers_units": "32,256,64,1024,1024,128,64,64,256,256,512,512",
+    "decoder_layers_units": "128,256,256,64,32,128,32,256,128,64,2048,32,128,256,1024,128,512,64,128,64,2048,128,1024,1024,128,512,128,512,32,2048,1024,1024,128,512,256,1024,128,256,1024,256,1024,256,2048,32,2048,256,256,512,1024,32,256,128,128,1024,512,64,2048,32,32,256,128,128,512,2048,1024,2048,256"
+}

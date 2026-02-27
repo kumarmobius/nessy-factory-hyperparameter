@@ -1,0 +1,21 @@
+{
+    "optimizer": "sgd",
+    "latent_dim": 74,
+    "encoder_activation": "elu",
+    "decoder_activation": "relu",
+    "output_activation": null,
+    "weight_init": "normal",
+    "reconstruction_loss": "mae",
+    "encoder_batch_norm": true,
+    "decoder_batch_norm": false,
+    "encoder_dropout": 0.04227726749242879,
+    "decoder_dropout": 0.2406590942262119,
+    "learning_rate": 0.00014096175149815865,
+    "weight_decay": 0.008862326508576254,
+    "batch_size": 64,
+    "momentum": 0.8779224698761134,
+    "mask_loss_weight": 0.6110669776011355,
+    "use_mask_token": true,
+    "encoder_layers_units": "32,512,512",
+    "decoder_layers_units": "1024,512"
+}

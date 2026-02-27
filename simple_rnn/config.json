@@ -1,0 +1,27 @@
+{
+  "model_name": "simple_rnn",
+
+  "input_dim": 10,
+  "output_dim": 1,
+
+  "hidden_dims": "128,64,32",
+  "dropout": 0.2,
+  "bidirectional": false,
+
+  "pooling": "last",
+  "learn_init_hidden": false,
+  "nonlinearity": "tanh",
+
+  "weight_init": "xavier_uniform",
+
+  "learning_rate": 0.001,
+  "optimizer": "adam",
+  "weight_decay": 0.0,
+
+  "batch_size": 64,
+  "epochs": 50,
+
+  "loss_function": "mseloss",
+  "early_stop_patience": 5,
+  "learning_method": "forward_forward"
+}

@@ -1,0 +1,20 @@
+\venv
+\*.bin
+\__pycache__
+\*.pyc
+\*.pkl
+\*.pt
+\*.pth
+\*.log
+\*.yaml
+*.pt
+test_files/artifacts/
+
+# Ignore model weights
+*.pt
+
+# Ignore artifacts
+test_files/artifacts/
+
+# Ignore virtual environment
+venv/

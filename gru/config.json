@@ -1,0 +1,26 @@
+{
+  "model_name": "gru",
+
+  "input_dim": 10,
+  "output_dim": 1,
+
+  "hidden_dims": "128,64",
+  "dropout": 0.2,
+  "bidirectional": false,
+
+  "pooling": "last",
+  "learn_init_hidden": false,
+  "activation": "relu",
+
+  "weight_init": "xavier_uniform",
+
+  "learning_rate": 0.001,
+  "optimizer": "adam",
+  "weight_decay": 0.0,
+
+  "batch_size": 64,
+  "epochs": 50,
+
+  "loss_function": "mseloss",
+  "learning_method": "forward_forward"
+}

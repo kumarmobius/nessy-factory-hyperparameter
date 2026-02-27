@@ -1,0 +1,32 @@
+{
+  "model_name": "masked_autoencoder",
+
+  "latent_dim": 64,
+
+  "encoder_layers_units": "128,128,64",
+  "decoder_layers_units": "64,128,128",
+
+  "encoder_activation": "relu",
+  "decoder_activation": "relu",
+
+  "encoder_batch_norm": true,
+  "decoder_batch_norm": true,
+
+  "encoder_dropout": 0.2,
+  "decoder_dropout": 0.2,
+
+  "learning_rate": 0.001,
+  "optimizer": "adam",
+
+  "batch_size": 128,
+  "epochs": 25,
+
+  "weight_decay": 0.00001,
+
+  "reconstruction_loss": "mse",
+
+  "early_stop_patience": 6,
+
+  "mask_loss_weight": 1.0,
+  "use_mask_token": false
+}

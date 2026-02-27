@@ -1,0 +1,15 @@
+{
+    "learning_rate": 0.0005611516415334506,
+    "batch_size": 16,
+    "optimizer": "adam",
+    "weight_decay": 0.0003967605077052988,
+    "num_layers": 7,
+    "dropout": 0.048836057003191935,
+    "bidirectional": false,
+    "pooling": "mean",
+    "learn_init_hidden": true,
+    "nonlinearity": "relu",
+    "weight_init": "orthogonal",
+    "loss_function": "maeloss",
+    "hidden_dims": "128,256,256,256,32,64,64"
+}
