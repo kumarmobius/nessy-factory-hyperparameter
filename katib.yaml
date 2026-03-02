@@ -70,7 +70,7 @@ outputs:
 
 implementation:
   container:
-    image: kumar2004/katib-test
+    image: kumar2004/katib-test:2
     command:
       - python3
       - -u
