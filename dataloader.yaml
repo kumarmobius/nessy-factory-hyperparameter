@@ -1,0 +1,115 @@
+name: Data Downloader from CDN
+inputs:
+  - {name: X_data_cdn, type: String, optional: false, default: ""}
+  - {name: y_data_cdn, type: String, optional: true, default: ""}
+
+outputs:
+  - {name: X_data_local, type: Data}
+  - {name: y_data_local, type: Data}
+
+implementation:
+  container:
+    image: gurpreetgandhi/nesy-factory:vtest4
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse, os, sys, tempfile, json, shutil, zipfile, logging
+        import requests
+        from requests.adapters import HTTPAdapter
+        try:
+            from urllib3.util import Retry
+        except Exception:
+            from urllib3 import Retry
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--X_data_cdn', required=True)
+        parser.add_argument('--y_data_cdn', default="")
+        parser.add_argument('--X_data_local', required=True)
+        parser.add_argument('--y_data_local', required=True)
+        args = parser.parse_args()
+
+        logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+        logger = logging.getLogger("data_downloader")
+
+        session = requests.Session()
+        retry = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+        session.mount("http://", HTTPAdapter(max_retries=retry))
+        session.mount("https://", HTTPAdapter(max_retries=retry))
+
+        def candidate_urls(url):
+            if "$$$_" in url:
+                return [url, url.replace("$$$_", "$$_")]
+            return [url]
+
+        def download_with_fallback(url):
+            last_err = None
+            for u in candidate_urls(url):
+                try:
+                    logger.info("Trying download: %s", u)
+                    r = session.get(u, timeout=60)
+                    r.raise_for_status()
+                    fd, tmp = tempfile.mkstemp()
+                    os.close(fd)
+                    with open(tmp, "wb") as f:
+                        f.write(r.content)
+                    return tmp
+                except Exception as e:
+                    logger.warning("Download failed for %s", u)
+                    last_err = e
+            raise last_err
+
+        def place_artifact(tmp_file, out_path):
+            try:
+                with zipfile.ZipFile(tmp_file):
+                    is_zip = True
+            except zipfile.BadZipFile:
+                is_zip = False
+
+            if is_zip:
+                os.makedirs(out_path, exist_ok=True)
+                with zipfile.ZipFile(tmp_file, "r") as z:
+                    z.extractall(out_path)
+                os.remove(tmp_file)
+                return out_path
+            else:
+                os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+                shutil.move(tmp_file, out_path)
+                return out_path
+
+        def write_output(out_path, val):
+            with open(out_path, "w") as f:
+                f.write("" if val is None else str(val))
+            with open(out_path + ".meta.json", "w") as f:
+                json.dump({"artifact_local": val}, f)
+
+        def fetch(url, out_path):
+            if not url.strip():
+                logger.info("No URL provided for %s, saving as None.", out_path)
+                write_output(out_path, None)
+                return None
+            try:
+                tmp = download_with_fallback(url)
+                placed = place_artifact(tmp, out_path)
+                write_output(out_path, placed)
+                return placed
+            except Exception as e:
+                logger.exception("Final failure downloading %s", url)
+                write_output(out_path, None)
+                return None
+
+        X_data = fetch(args.X_data_cdn, args.X_data_local)
+        y_data = fetch(args.y_data_cdn, args.y_data_local)
+
+        logger.info("Done. X_data=%s y_data=%s", X_data, y_data)
+
+    args:
+      - --X_data_cdn
+      - {inputValue: X_data_cdn}
+      - --y_data_cdn
+      - {inputValue: y_data_cdn}
+      - --X_data_local
+      - {outputPath: X_data_local}
+      - --y_data_local
+      - {outputPath: y_data_local}
