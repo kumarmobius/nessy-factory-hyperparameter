@@ -1,4 +1,4 @@
-name: NeSy Hyperparameter Tuner V1.7
+name: NeSy Hyperparameter Tuner V1.8
 description: Launches a Katib experiment for NeSy models using config-driven training scripts.
 inputs:
   - name: projectid
@@ -209,7 +209,33 @@ implementation:
         print("=== DEBUG: BUILDING TRIAL TEMPLATE ===")
         trial_parameters = []
         trial_args       = []
-
+        
+        print("DEBUG: Extracting fixed parameters from config")
+        arch = config_dict.get("architecture", {})
+        training = config_dict.get("training", {})
+        optimizer_config = config_dict.get("optimizer", {})
+        
+        # Add fixed parameters to trial_args
+        if "input_dim" in arch:
+            trial_args.extend(["--input_dim", str(arch["input_dim"])])
+            print(f"DEBUG: Fixed param: input_dim = {arch['input_dim']}")
+        
+        if "epochs" in training:
+            trial_args.extend(["--epochs", str(training["epochs"])])
+            print(f"DEBUG: Fixed param: epochs = {training['epochs']}")
+        
+        if "optimizer" in optimizer_config:
+            trial_args.extend(["--optimizer", optimizer_config["optimizer"]])
+            print(f"DEBUG: Fixed param: optimizer = {optimizer_config['optimizer']}")
+        
+        # Add early_stopping if present
+        if "early_stopping" in training:
+            trial_args.extend(["--early_stopping", str(training["early_stopping"])])
+            print(f"DEBUG: Fixed param: early_stopping = {training['early_stopping']}")
+        
+        # Add save_path if needed (optional)
+        # trial_args.extend(["--save_path", "/tmp/model.pt"])
+        
         # Tunable hyperparameters — injected by Katib per trial
         for p in params_input:
             param_name = p["name"]
@@ -223,10 +249,19 @@ implementation:
                 "${trialParameters." + param_name + "}"
             ])
             print(f"  ✓ Trial param: {param_name}")
-
+        
         # Fixed args — same for every trial
         trial_args.extend(["--config",   cfg_b64])
         trial_args.extend(["--data_path", args.X_data_cdn])
+        
+        # Only pass y_data_cdn if it was actually provided
+        if y_cdn_provided:
+            trial_args.extend(["--y_path", args.y_data_cdn])
+            print("DEBUG: y_data_cdn will be passed to trial args")
+        else:
+            print("DEBUG: y_data_cdn is empty — NOT passed to trial args")
+        
+        print(f"DEBUG: Final trial args: {trial_args}")
 
         # Only pass y_data_cdn if it was actually provided
         if y_cdn_provided:
