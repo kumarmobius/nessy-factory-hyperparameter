@@ -1,0 +1,239 @@
+name: Search Space Generator for Katib
+inputs:
+  - {name: model_config, type: String}
+  - {name: max_n_layers, type: Integer, optional: true, default: "4"}
+
+outputs:
+  - {name: search_space, type: Data}
+
+implementation:
+  container:
+    image: gurpreetgandhi/nesy-factory:vtest4
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse, json, os, sys, logging
+        from itertools import product
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--model_config', required=True)
+        parser.add_argument('--max_n_layers', type=int, default=4)
+        parser.add_argument('--search_space', required=True)
+        args = parser.parse_args()
+
+        logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+        logger = logging.getLogger("search_space_generator")
+
+        # Dynamically generate all layer combinations up to max_n_layers
+        UNITS = [16, 32, 64, 128, 256, 512, 1024]
+
+        def generate_encoder_dims(max_layers):
+            dims_set = set()
+            for n_layers in range(1, max_layers + 1):
+                for combo in product(UNITS, repeat=n_layers):
+                    # enforce non-increasing (encoder compresses)
+                    if all(combo[i] >= combo[i+1] for i in range(len(combo)-1)):
+                        dims_set.add(",".join(str(u) for u in combo))
+            return sorted(dims_set, key=lambda x: (len(x.split(",")), x))
+
+        def generate_decoder_dims(max_layers):
+            dims_set = set()
+            for n_layers in range(1, max_layers + 1):
+                for combo in product(UNITS, repeat=n_layers):
+                    # enforce non-decreasing (decoder expands)
+                    if all(combo[i] <= combo[i+1] for i in range(len(combo)-1)):
+                        dims_set.add(",".join(str(u) for u in combo))
+            return sorted(dims_set, key=lambda x: (len(x.split(",")), x))
+
+        max_n = args.max_n_layers
+        logger.info("Generating layer combos for max_n_layers=%d", max_n)
+
+        encoder_hidden_options = generate_encoder_dims(max_n)
+        decoder_options        = generate_decoder_dims(max_n)
+
+        logger.info("hidden_dims / encoder_layers options: %d", len(encoder_hidden_options))
+        logger.info("decoder_layers options:               %d", len(decoder_options))
+
+      
+        # Predefined ranges / categories for scalar params
+        DOUBLE_PARAMS = {
+            "lr":              {"min": "0.00001", "max": "0.1"},
+            "learning_rate":   {"min": "0.00001", "max": "0.1"},
+            "weight_decay":    {"min": "0.000001", "max": "0.01"},
+            "dropout":         {"min": "0.0",      "max": "0.5"},
+            "encoder_dropout": {"min": "0.0",      "max": "0.5"},
+            "decoder_dropout": {"min": "0.0",      "max": "0.5"},
+            "noise_factor":    {"min": "0.05",     "max": "0.5"},
+            "momentum":        {"min": "0.8",      "max": "0.99"},
+            "grad_clip":       {"min": "0.1",      "max": "10.0"},
+            "beta":            {"min": "0.1",      "max": "5.0"},
+            "val_split":       {"min": "0.1",      "max": "0.3"},
+        }
+
+        INT_PARAMS = {
+            "batch_size": {"min": "16",  "max": "128"},
+            "latent_dim": {"min": "4",   "max": "64"},
+        }
+
+        CATEGORICAL_PARAMS = {
+            "activation":      ["relu", "leaky_relu", "gelu", "tanh", "sigmoid", "elu"],
+            "noise_type":      ["gaussian", "salt_pepper", "none"],
+            "weight_init":     ["xavier", "kaiming", "normal", "orthogonal", "xavier_uniform", "kaiming_uniform"],
+            "loss_function":   ["mse", "mseloss", "mae", "bce", "cross_entropy", "huber", "kl_divergence", "cosine_embedding"],
+            "learning_method": ["forward_forward", "backprop", "cafo"],
+            "pooling":         ["last", "mean", "max"],
+            "optimizer_name":  ["adam", "adamw", "sgd", "rmsprop", "adagrad", "adadelta", "adamax"],
+            # dynamically built below
+            "hidden_dims":     encoder_hidden_options,
+            "encoder_layers":  encoder_hidden_options,
+            "decoder_layers":  decoder_options,
+        }
+
+        SKIP_PARAMS = {
+            "epochs", "early_stopping", "save_path", "data_path",
+            "num_workers", "input_dim", "feature_dim", "output_dim",
+            "batch_norm", "encoder_batch_norm", "decoder_batch_norm",
+            "bidirectional", "learn_init_hidden",
+        }
+
+        # ──────────────────────────────────────────────────────────────
+        # Helpers
+        # ──────────────────────────────────────────────────────────────
+        def is_fixed(value):
+            return isinstance(value, list) and len(value) == 1
+
+        def is_tunable_list(value):
+            return isinstance(value, list) and len(value) > 1
+
+        def make_param(name, value, katib_name=None):
+            katib_name = katib_name or name
+
+            if is_fixed(value):
+                logger.info("Skipping fixed param: %s = %s", name, value)
+                return None
+
+            if name in SKIP_PARAMS:
+                logger.info("Skipping excluded param: %s", name)
+                return None
+
+            # User provided explicit multi-value list
+            if is_tunable_list(value):
+                return {
+                    "name": katib_name,
+                    "parameter_type": "categorical",
+                    "feasible_space": {"list": [str(v) for v in value]},
+                }
+
+            if name in DOUBLE_PARAMS:
+                return {
+                    "name": katib_name,
+                    "parameter_type": "double",
+                    "feasible_space": DOUBLE_PARAMS[name],
+                }
+
+            if name in INT_PARAMS:
+                return {
+                    "name": katib_name,
+                    "parameter_type": "int",
+                    "feasible_space": INT_PARAMS[name],
+                }
+
+            if name in CATEGORICAL_PARAMS:
+                return {
+                    "name": katib_name,
+                    "parameter_type": "categorical",
+                    "feasible_space": {"list": CATEGORICAL_PARAMS[name]},
+                }
+
+            logger.warning("Unknown param '%s' — skipping.", name)
+            return None
+
+        # ──────────────────────────────────────────────────────────────
+        # Parse config & build search space
+        # ──────────────────────────────────────────────────────────────
+        config = json.loads(args.model_config)
+        logger.info("Generating Katib search space for model: %s", config.get("model", "unknown"))
+
+        search_space = []
+
+        def add(name, value, katib_name=None):
+            p = make_param(name, value, katib_name)
+            if p:
+                search_space.append(p)
+
+        # data
+        data = config.get("data", {})
+        add("batch_size", data.get("batch_size", []))
+        add("val_split",  data.get("val_split", []))
+
+        # training
+        training = config.get("training", {})
+        lr_val = training.get("lr") or training.get("learning_rate")
+        if lr_val is not None:
+            add("lr", lr_val, katib_name="learning_rate")
+        add("weight_decay",    training.get("weight_decay", []))
+        add("momentum",        training.get("momentum", []))
+        add("grad_clip",       training.get("grad_clip", []))
+        add("beta",            training.get("beta", []))
+        add("learning_method", training.get("learning_method", []))
+
+        # optimizer
+        optimizer = config.get("optimizer", {})
+        add("optimizer_name", optimizer.get("name", []), katib_name="optimizer_name")
+        add("weight_decay",   optimizer.get("weight_decay", []))
+        add("momentum",       optimizer.get("momentum", []))
+
+        # architecture
+        arch = config.get("architecture", {})
+        add("dropout",         arch.get("dropout", []))
+        add("encoder_dropout", arch.get("encoder_dropout", []))
+        add("decoder_dropout", arch.get("decoder_dropout", []))
+        add("latent_dim",      arch.get("latent_dim", []))
+        add("activation",      arch.get("activation", []))
+        add("weight_init",     arch.get("weight_init", []))
+        add("hidden_dims",     arch.get("hidden_dims", []))
+        add("encoder_layers",  arch.get("encoder_layers", []))
+        add("decoder_layers",  arch.get("decoder_layers", []))
+        add("pooling",         arch.get("pooling", []))
+
+        # noise
+        noise = config.get("noise", {})
+        noise_type_val   = noise.get("noise_type")   or arch.get("noise_type")
+        noise_factor_val = noise.get("noise_factor") or arch.get("noise_factor")
+        if noise_type_val is not None:
+            add("noise_type",   noise_type_val)
+        if noise_factor_val is not None:
+            add("noise_factor", noise_factor_val)
+
+        # loss
+        loss = config.get("loss", {})
+        add("loss_function", loss.get("loss_function", []))
+
+        # Deduplicate (keep first occurrence)
+        seen, deduped = set(), []
+        for p in search_space:
+            if p["name"] not in seen:
+                seen.add(p["name"])
+                deduped.append(p)
+
+        logger.info("Final search space: %d parameters.", len(deduped))
+        for p in deduped:
+            fs = p["feasible_space"]
+            display = f"[{len(fs['list'])} options]" if "list" in fs else fs
+            logger.info("  → %-20s %s %s", p["name"], p["parameter_type"], display)
+
+        os.makedirs(os.path.dirname(args.search_space) or ".", exist_ok=True)
+        with open(args.search_space, "w") as f:
+            json.dump(deduped, f, indent=2)
+
+        logger.info("Search space written to %s", args.search_space)
+
+    args:
+      - --model_config
+      - {inputValue: model_config}
+      - --max_n_layers
+      - {inputValue: max_n_layers}
+      - --search_space
+      - {outputPath: search_space}
