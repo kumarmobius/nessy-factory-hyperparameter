@@ -1,4 +1,4 @@
-name: NeSy Hyperparameter Tuner V1.1
+name: NeSy Hyperparameter Tuner V1.2
 description: Launches a Katib experiment for NeSy models using config-driven training scripts.
 inputs:
   - name: projectid
@@ -256,7 +256,7 @@ implementation:
                             "containers": [
                                 {
                                     "name":    "training-container",
-                                    "image":   "kumar2004/katib-test",
+                                    "image":   "kumar2004/katib-test:3",
                                     "command": ["python", train_script],
                                     "args":    trial_args,
                                     "resources": {
