@@ -1,4 +1,4 @@
-name: NeSy Hyperparameter Tuner V1.2
+name: NeSy Hyperparameter Tuner V1.3
 description: Launches a Katib experiment for NeSy models using config-driven training scripts.
 inputs:
   - name: projectid
@@ -226,11 +226,11 @@ implementation:
 
         # Fixed args — same for every trial
         trial_args.extend(["--config",   cfg_b64])
-        trial_args.extend(["--X_data_cdn", args.X_data_cdn])
+        trial_args.extend(["--data_path", args.X_data_cdn])
 
         # Only pass y_data_cdn if it was actually provided
         if y_cdn_provided:
-            trial_args.extend(["--y_data_cdn", args.y_data_cdn])
+            trial_args.extend(["--y_path", args.y_data_cdn])
             print("DEBUG: y_data_cdn will be passed to trial args")
         else:
             print("DEBUG: y_data_cdn is empty — NOT passed to trial args")
