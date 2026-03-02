@@ -1,4 +1,4 @@
-name: NeSy Hyperparameter Tuner V1
+name: NeSy Hyperparameter Tuner V1.1
 description: Launches a Katib experiment for NeSy models using config-driven training scripts.
 inputs:
   - name: projectid
@@ -19,7 +19,7 @@ inputs:
     description: CDN URL of y (labels) dataset — leave empty if not applicable
 
   - name: parameters_to_tune
-    type: String
+    type: Data
     description: List of parameter specs to tune (Katib V1beta1ParameterSpec format as JSON)
 
   - name: objective_metric_name
