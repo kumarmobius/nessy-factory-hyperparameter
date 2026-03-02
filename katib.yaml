@@ -1,4 +1,4 @@
-name: NeSy Hyperparameter Tuner V1.4
+name: NeSy Hyperparameter Tuner V1.5
 description: Launches a Katib experiment for NeSy models using config-driven training scripts.
 inputs:
   - name: projectid
@@ -193,7 +193,7 @@ implementation:
         )
 
         # ── Experiment identifiers ─────────────────────────────────────
-        experiment_name = f"{model_name}_{str(uuid.uuid4())[:8]}"
+        experiment_name = f"{model_name.replace('_', '-')}-{str(uuid.uuid4())[:8]}"
         print(f"DEBUG: Experiment name: {experiment_name}")
 
         # ── Objective & algorithm ──────────────────────────────────────
