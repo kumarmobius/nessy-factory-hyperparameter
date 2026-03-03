@@ -1,4 +1,4 @@
-name: NeSy Hyperparameter Tuner V2.1
+name: NeSy Hyperparameter Tuner V2.2
 description: Launches a Katib experiment for NeSy models using config-driven training scripts.
 inputs:
   - name: projectid
@@ -269,7 +269,9 @@ implementation:
         else:
             print("DEBUG: y_data_cdn empty — NOT passed to trial args")
 
-        print(f"DEBUG: Total trial args ({len(trial_args)}): {trial_args}")
+        # Prepend --model so main.py dispatcher routes to correct training script
+        full_trial_args = ["--model", model_name] + trial_args
+        print(f"DEBUG: Total trial args ({len(full_trial_args)}): {full_trial_args}")
 
         # ── Trial template ─────────────────────────────────────────────
         trial_template = V1beta1TrialTemplate(
@@ -291,10 +293,10 @@ implementation:
                                     "name":            "training-container",
                                     "image":           "kumar2004/katib-test:5",
                                     "imagePullPolicy": "Always",
-                                    "command":         ["python", train_script],
-                                    "args":            trial_args,
+                                    "command":         ["python", "main.py"],
+                                    "args":            full_trial_args,
                                     "resources": {
-                                        "limits": {"cpu": "2", "memory": "4Gi"}
+                                        "limits": {"cpu": "1", "memory": "2Gi"}
                                     }
                                 }
                             ],
