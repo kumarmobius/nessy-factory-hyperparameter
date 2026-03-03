@@ -1,4 +1,4 @@
-name: NeSy Hyperparameter Tuner V2.2
+name: NeSy Hyperparameter Tuner V2.3
 description: Launches a Katib experiment for NeSy models using config-driven training scripts.
 inputs:
   - name: projectid
@@ -145,9 +145,6 @@ implementation:
 
         namespace = "admin"
 
-        # ── Strip ALL whitespace/newlines from CDN URLs ───────────────
-        # .strip() alone isn't enough — use re.sub to remove every
-        # whitespace character including embedded \n \r \t
         import re
         def clean_url(url: str) -> str:
             return re.sub(r'\s+', '', url)
