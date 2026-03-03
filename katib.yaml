@@ -1,4 +1,4 @@
-name: NeSy Hyperparameter Tuner V2.0
+name: NeSy Hyperparameter Tuner V2.1
 description: Launches a Katib experiment for NeSy models using config-driven training scripts.
 inputs:
   - name: projectid
@@ -145,11 +145,17 @@ implementation:
 
         namespace = "admin"
 
-        # ── Strip whitespace/newlines from CDN URLs ────────────────────
-        X_data_cdn = args.X_data_cdn.strip()
-        y_data_cdn = args.y_data_cdn.strip()
+        # ── Strip ALL whitespace/newlines from CDN URLs ───────────────
+        # .strip() alone isn't enough — use re.sub to remove every
+        # whitespace character including embedded \n \r \t
+        import re
+        def clean_url(url: str) -> str:
+            return re.sub(r'\s+', '', url)
+
+        X_data_cdn = clean_url(args.X_data_cdn)
+        y_data_cdn = clean_url(args.y_data_cdn)
         y_cdn_provided = y_data_cdn != ""
-        print(f"DEBUG: X_data_cdn={X_data_cdn}")
+        print(f"DEBUG: X_data_cdn (cleaned)={X_data_cdn}")
         print(f"DEBUG: y_cdn_provided={y_cdn_provided}")
 
         # ── Resolve model name + train script from config ──────────────
@@ -232,10 +238,12 @@ implementation:
                 trial_args.extend([f"--{key}", str(training[key])])
                 print(f"DEBUG: Fixed training param: {key} = {training[key]}")
 
-        # optimizer name — fixed, using 'name' key from optimizer section
-        if "name" in optimizer_config and "optimizer" not in tunable_names:
-            trial_args.extend(["--optimizer", str(optimizer_config["name"])])
-            print(f"DEBUG: Fixed param: optimizer = {optimizer_config['name']}")
+        # optimizer name — always pass it, training script needs it
+        # supports both "name" and "optimizer" keys
+        optimizer_name = optimizer_config.get("name") or optimizer_config.get("optimizer")
+        if optimizer_name and "optimizer" not in tunable_names:
+            trial_args.extend(["--optimizer", str(optimizer_name)])
+            print(f"DEBUG: Fixed param: optimizer = {optimizer_name}")
 
         # num_workers from data section
         if "num_workers" in data_config and "num_workers" not in tunable_names:
