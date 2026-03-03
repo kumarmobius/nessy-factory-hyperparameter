@@ -1,4 +1,4 @@
-name: NeSy Hyperparameter Tuner V1.8
+name: NeSy Hyperparameter Tuner V2.0
 description: Launches a Katib experiment for NeSy models using config-driven training scripts.
 inputs:
   - name: projectid
@@ -70,7 +70,7 @@ outputs:
 
 implementation:
   container:
-    image: kumar2004/katib-test:4
+    image: kumar2004/katib-test:5
     command:
       - python3
       - -u
@@ -81,7 +81,6 @@ implementation:
         import os
         import time
         import uuid
-        import base64
         from kubernetes import client, config
         import kubeflow.katib as katib
         from kubeflow.katib import (
@@ -96,7 +95,7 @@ implementation:
             V1beta1FileSystemPath,
         )
 
-        # ── Model name → training script mapping ──────────────────────
+        # ── Model → training script mapping ───────────────────────────
         TRAIN_SCRIPT_MAP = {
             "denoise_ae": "train_scripts/train_dae.py",
             "rnn":        "train_scripts/train_rnn.py",
@@ -105,7 +104,16 @@ implementation:
             "mask_ae":    "train_scripts/train_masked_ae.py",
         }
 
-        print("=== KATIB TUNER: STARTING COMPONENT ===")
+        # Fixed params that come from config and are passed as-is to trial
+        # These are NOT tuned by Katib — they are constant across all trials
+        FIXED_ARCH_KEYS = [
+            "input_dim", "feature_dim", "output_dim",
+            "batch_norm", "encoder_batch_norm", "decoder_batch_norm",
+            "bidirectional", "learn_init_hidden",
+        ]
+        FIXED_TRAINING_KEYS = ["epochs", "early_stopping"]
+
+        print("=== KATIB TUNER V2.0: STARTING ===")
 
         # ── Load Kubernetes config ─────────────────────────────────────
         try:
@@ -116,7 +124,7 @@ implementation:
             config.load_kube_config()
             print("DEBUG: Loaded kube config")
 
-        # ── Argument parsing ───────────────────────────────────────────
+        # ── Parse arguments ────────────────────────────────────────────
         parser = argparse.ArgumentParser()
         parser.add_argument("--projectid",                type=str,   required=True)
         parser.add_argument("--config_json",              type=str,   required=True)
@@ -137,7 +145,14 @@ implementation:
 
         namespace = "admin"
 
-        # ── Resolve model name and training script from config ─────────
+        # ── Strip whitespace/newlines from CDN URLs ────────────────────
+        X_data_cdn = args.X_data_cdn.strip()
+        y_data_cdn = args.y_data_cdn.strip()
+        y_cdn_provided = y_data_cdn != ""
+        print(f"DEBUG: X_data_cdn={X_data_cdn}")
+        print(f"DEBUG: y_cdn_provided={y_cdn_provided}")
+
+        # ── Resolve model name + train script from config ──────────────
         print("=== DEBUG: PARSING CONFIG_JSON ===")
         config_dict = json.loads(args.config_json)
         model_name  = config_dict.get("model", "").strip().lower()
@@ -146,24 +161,15 @@ implementation:
 
         train_script = TRAIN_SCRIPT_MAP.get(model_name)
         if not train_script:
-            raise ValueError(
-                f"Unknown model '{model_name}'. "
-                f"Supported: {list(TRAIN_SCRIPT_MAP.keys())}"
-            )
+            raise ValueError(f"Unknown model '{model_name}'. Supported: {list(TRAIN_SCRIPT_MAP.keys())}")
 
         print(f"DEBUG: model_name={model_name}")
         print(f"DEBUG: train_script={train_script}")
 
-        cfg_b64 = base64.b64encode(args.config_json.encode("utf-8")).decode("utf-8")
-
-        # ── Decide whether y_data_cdn is provided ─────────────────────
-        y_cdn_provided = args.y_data_cdn.strip() != ""
-        print(f"DEBUG: X_data_cdn={args.X_data_cdn}")
-        print(f"DEBUG: y_data_cdn={'provided → ' + args.y_data_cdn if y_cdn_provided else 'NOT provided — will be omitted from trial args'}")
-
         # ── Parse parameters_to_tune ───────────────────────────────────
         print("=== DEBUG: PARSING PARAMETERS_TO_TUNE ===")
         params_input = json.loads(args.parameters_to_tune)
+        tunable_names = {p["name"] for p in params_input}
         print(f"DEBUG: {len(params_input)} parameters to tune:")
         for i, p in enumerate(params_input):
             print(f"  {i+1}. {p.get('name')} [{p.get('parameter_type')}] → {p.get('feasible_space')}")
@@ -192,11 +198,10 @@ implementation:
             collector={"kind": "File"}
         )
 
-        # ── Experiment identifiers ─────────────────────────────────────
         experiment_name = f"{model_name.replace('_', '-')}-{str(uuid.uuid4())[:8]}"
         print(f"DEBUG: Experiment name: {experiment_name}")
 
-        # ── Objective & algorithm ──────────────────────────────────────
+        # ── Objective, algorithm, early stopping ───────────────────────
         objective_spec = V1beta1ObjectiveSpec(
             type=args.objective_type,
             goal=args.objective_goal,
@@ -205,38 +210,39 @@ implementation:
         algorithm_spec      = V1beta1AlgorithmSpec(algorithm_name=args.algorithm_name)
         early_stopping_spec = V1beta1EarlyStoppingSpec(algorithm_name=args.early_stopping_algorithm)
 
-        # ── Build trial parameters and args ───────────────────────────
-        print("=== DEBUG: BUILDING TRIAL TEMPLATE ===")
+        # ── Build trial args ───────────────────────────────────────────
+        print("=== DEBUG: BUILDING TRIAL ARGS ===")
+        arch             = config_dict.get("architecture", {})
+        training         = config_dict.get("training", {})
+        optimizer_config = config_dict.get("optimizer", {})
+        data_config      = config_dict.get("data", {})
+
         trial_parameters = []
         trial_args       = []
-        
-        print("DEBUG: Extracting fixed parameters from config")
-        arch = config_dict.get("architecture", {})
-        training = config_dict.get("training", {})
-        optimizer_config = config_dict.get("optimizer", {})
-        
-        # Add fixed parameters to trial_args
-        if "input_dim" in arch:
-            trial_args.extend(["--input_dim", str(arch["input_dim"])])
-            print(f"DEBUG: Fixed param: input_dim = {arch['input_dim']}")
-        
-        if "epochs" in training:
-            trial_args.extend(["--epochs", str(training["epochs"])])
-            print(f"DEBUG: Fixed param: epochs = {training['epochs']}")
-        
-        if "optimizer" in optimizer_config:
-            trial_args.extend(["--optimizer", optimizer_config["optimizer"]])
-            print(f"DEBUG: Fixed param: optimizer = {optimizer_config['optimizer']}")
-        
-        # Add early_stopping if present
-        if "early_stopping" in training:
-            trial_args.extend(["--early_stopping", str(training["early_stopping"])])
-            print(f"DEBUG: Fixed param: early_stopping = {training['early_stopping']}")
-        
-        # Add save_path if needed (optional)
-        # trial_args.extend(["--save_path", "/tmp/model.pt"])
-        
-        # Tunable hyperparameters — injected by Katib per trial
+
+        # 1. Fixed args from config (not tuned, same for every trial)
+        #    Only add if the key exists in config AND is not being tuned
+        for key in FIXED_ARCH_KEYS:
+            if key in arch and key not in tunable_names:
+                trial_args.extend([f"--{key}", str(arch[key])])
+                print(f"DEBUG: Fixed arch param: {key} = {arch[key]}")
+
+        for key in FIXED_TRAINING_KEYS:
+            if key in training and key not in tunable_names:
+                trial_args.extend([f"--{key}", str(training[key])])
+                print(f"DEBUG: Fixed training param: {key} = {training[key]}")
+
+        # optimizer name — fixed, using 'name' key from optimizer section
+        if "name" in optimizer_config and "optimizer" not in tunable_names:
+            trial_args.extend(["--optimizer", str(optimizer_config["name"])])
+            print(f"DEBUG: Fixed param: optimizer = {optimizer_config['name']}")
+
+        # num_workers from data section
+        if "num_workers" in data_config and "num_workers" not in tunable_names:
+            trial_args.extend(["--num_workers", str(data_config["num_workers"])])
+            print(f"DEBUG: Fixed param: num_workers = {data_config['num_workers']}")
+
+        # 2. Tunable args — injected per trial by Katib
         for p in params_input:
             param_name = p["name"]
             trial_parameters.append({
@@ -244,34 +250,20 @@ implementation:
                 "description": param_name,
                 "reference":   param_name
             })
-            trial_args.extend([
-                "--" + param_name,
-                "${trialParameters." + param_name + "}"
-            ])
-            print(f"  ✓ Trial param: {param_name}")
-        
-        # Fixed args — same for every trial
-        trial_args.extend(["--config",   cfg_b64])
-        trial_args.extend(["--data_path", args.X_data_cdn])
-        
-        # Only pass y_data_cdn if it was actually provided
+            trial_args.extend([f"--{param_name}", "${trialParameters." + param_name + "}"])
+            print(f"  ✓ Tunable param: {param_name}")
+
+        # 3. Dataset CDN URLs — same for every trial
+        trial_args.extend(["--data_path", X_data_cdn])
         if y_cdn_provided:
-            trial_args.extend(["--y_path", args.y_data_cdn])
-            print("DEBUG: y_data_cdn will be passed to trial args")
+            trial_args.extend(["--y_path", y_data_cdn])
+            print(f"DEBUG: y_path will be passed: {y_data_cdn}")
         else:
-            print("DEBUG: y_data_cdn is empty — NOT passed to trial args")
-        
-        print(f"DEBUG: Final trial args: {trial_args}")
+            print("DEBUG: y_data_cdn empty — NOT passed to trial args")
 
-        # Only pass y_data_cdn if it was actually provided
-        if y_cdn_provided:
-            trial_args.extend(["--y_path", args.y_data_cdn])
-            print("DEBUG: y_data_cdn will be passed to trial args")
-        else:
-            print("DEBUG: y_data_cdn is empty — NOT passed to trial args")
+        print(f"DEBUG: Total trial args ({len(trial_args)}): {trial_args}")
 
-        print(f"DEBUG: Final trial args: {trial_args}")
-
+        # ── Trial template ─────────────────────────────────────────────
         trial_template = V1beta1TrialTemplate(
             retain=True,
             primary_container_name="training-container",
@@ -283,18 +275,16 @@ implementation:
                     "ttlSecondsAfterFinished": 86400,
                     "template": {
                         "metadata": {
-                            "annotations": {
-                                "sidecar.istio.io/inject": "false"
-                            }
+                            "annotations": {"sidecar.istio.io/inject": "false"}
                         },
                         "spec": {
                             "containers": [
                                 {
-                                    "name":    "training-container",
-                                    "image":   "kumar2004/katib-test:4",
+                                    "name":            "training-container",
+                                    "image":           "kumar2004/katib-test:5",
                                     "imagePullPolicy": "Always",
-                                    "command": ["python", train_script],
-                                    "args":    trial_args,
+                                    "command":         ["python", train_script],
+                                    "args":            trial_args,
                                     "resources": {
                                         "limits": {"cpu": "2", "memory": "4Gi"}
                                     }
@@ -307,7 +297,7 @@ implementation:
             }
         )
 
-        # ── Assemble and launch experiment ─────────────────────────────
+        # ── Create and launch experiment ───────────────────────────────
         print("=== DEBUG: CREATING EXPERIMENT ===")
         experiment_spec = V1beta1ExperimentSpec(
             objective=objective_spec,
@@ -322,8 +312,7 @@ implementation:
         )
 
         katib_client = katib.KatibClient(namespace=namespace)
-
-        experiment = V1beta1Experiment(
+        experiment   = V1beta1Experiment(
             api_version="kubeflow.org/v1beta1",
             kind="Experiment",
             metadata=client.V1ObjectMeta(name=experiment_name, namespace=namespace),
@@ -369,11 +358,11 @@ implementation:
 
         payload_data = []
         for idx, trial in enumerate(trials, start=1):
-            trial_data = {}
-            trial_data["projectId"]   = args.projectid.strip()
-            trial_data["model_name"]  = f"{model_name}_trial{idx}_{str(uuid.uuid4())[:8]}"
-            trial_data["timestamp"]   = int(time.time() * 1000)
-
+            trial_data = {
+                "projectId":  args.projectid.strip(),
+                "model_name": f"{model_name}_trial{idx}_{str(uuid.uuid4())[:8]}",
+                "timestamp":  int(time.time() * 1000),
+            }
             if hasattr(trial, "spec") and hasattr(trial.spec, "parameter_assignments"):
                 for param in trial.spec.parameter_assignments:
                     trial_data[param.name] = auto_cast(param.value)
@@ -392,13 +381,13 @@ implementation:
                 trial_data["metrics_value"] = []
 
             payload_data.append(trial_data)
+            print(f"DEBUG: Trial {idx} → {trial_data}")
 
         payload = {"data": payload_data}
-        print(f"DEBUG: Payload has {len(payload_data)} trial(s)")
-
         os.makedirs(os.path.dirname(args.payload) or ".", exist_ok=True)
         with open(args.payload, "w") as f:
             json.dump(payload, f)
+        print(f"DEBUG: Payload saved with {len(payload_data)} trial(s)")
 
         # ── Best hyperparameters ───────────────────────────────────────
         print("=== DEBUG: GETTING BEST HYPERPARAMETERS ===")
