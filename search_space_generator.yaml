@@ -1,4 +1,4 @@
-name: Search Space Generator for Katib V3
+name: Search Space Generator for Katib V3.1
 inputs:
   - {name: model_config, type: String}
   - {name: max_n_layers, type: Integer, optional: true, default: "4"}
@@ -74,7 +74,7 @@ implementation:
             "activation":        ["relu", "leaky_relu", "gelu", "tanh", "sigmoid", "elu"],
             "noise_type":        ["gaussian", "salt_pepper", "none"],
             "weight_init":       ["xavier", "kaiming", "normal", "orthogonal", "xavier_uniform", "kaiming_uniform"],
-            "loss_function":     ["mse", "mseloss", "mae", "bce", "cross_entropy", "huber", "kl_divergence", "cosine_embedding"],
+            "loss_function":     ["mse", "mseloss", "mae", "huber"],
             "learning_method":   ["forward_forward", "backprop", "cafo"],
             "pooling":           ["last", "mean", "max"],
             "name":              ["adam", "adamw", "sgd", "rmsprop", "adagrad", "adadelta", "adamax"],  # optimizer.name
@@ -91,7 +91,6 @@ implementation:
             "bidirectional", "learn_init_hidden",
         }
 
-        # ── Helpers ───────────────────────────────────────────────────
         def is_fixed(value):
             return isinstance(value, list) and len(value) == 1
 
