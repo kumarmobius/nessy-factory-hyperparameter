@@ -1,4 +1,4 @@
-name: NeSy Hyperparameter Tuner V3
+name: NeSy Hyperparameter Tuner V3.1
 description: Launches a Katib experiment for NeSy models using config-driven training scripts.
 inputs:
   - name: projectid
@@ -265,12 +265,10 @@ implementation:
             print(f"  ✓ Tunable param: {param_name}")
 
         # 3. Dataset CDN URLs — same for every trial
-        trial_args.extend(["--data_path", X_data_cdn])
-        if y_cdn_provided:
-            trial_args.extend(["--y_path", y_data_cdn])
-            print(f"DEBUG: y_path will be passed: {y_data_cdn}")
-        else:
-            print("DEBUG: y_data_cdn empty — NOT passed to trial args")
+        trial_args.extend(["--x_path", X_data_cdn])
+        trial_args.extend(["--y_path", y_data_cdn])
+        print(f"DEBUG: x_path={X_data_cdn}")
+        print(f"DEBUG: y_path={y_data_cdn}")
 
         # Prepend --model so main.py dispatcher routes to correct training script
         full_trial_args = ["--model", model_name] + trial_args
