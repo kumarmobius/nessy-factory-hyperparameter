@@ -1,4 +1,4 @@
-name: NeSy Hyperparameter Tuner V3.1
+name: NeSy Hyperparameter Tuner V3.2
 description: Launches a Katib experiment for NeSy models using config-driven training scripts.
 inputs:
   - name: projectid
@@ -74,7 +74,7 @@ outputs:
 
 implementation:
   container:
-    image: placeholder  # Overridden at runtime by the docker_image input — see args below
+    image: kumar2004/katib-test:5
     command:
       - python3
       - -u
