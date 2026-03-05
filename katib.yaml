@@ -1,4 +1,4 @@
-name: NeSy Hyperparameter Tuner V3.5
+name: NeSy Hyperparameter Tuner V4
 description: Launches a Katib experiment for NeSy models using config-driven training scripts.
 inputs:
   - name: projectid
@@ -20,7 +20,7 @@ inputs:
 
   - name: docker_image
     type: String
-    description: Docker image to use for both the component container and each trial pod (e.g., kumar2004/katib-test:5)
+    description: Docker image to use for both the component container and each trial pod
 
   - name: parameters_to_tune
     type: Data
@@ -62,6 +62,21 @@ inputs:
     type: Integer
     default: '2'
     description: Maximum number of failed trials
+
+  - name: namespace
+    type: String
+    default: "admin"
+    description: Kubernetes namespace to launch the Katib experiment in
+
+  - name: cpu_limit
+    type: String
+    default: "1"
+    description: CPU limit for each trial pod (e.g., "1", "2", "500m")
+
+  - name: memory_limit
+    type: String
+    default: "2Gi"
+    description: Memory limit for each trial pod (e.g., "2Gi", "4Gi", "512Mi")
 
 outputs:
   - name: best_hyperparams
@@ -108,8 +123,6 @@ implementation:
             "mask_ae":    "train_scripts/train_masked_ae.py",
         }
 
-        # Fixed params that come from config and are passed as-is to trial
-        # These are NOT tuned by Katib — they are constant across all trials
         FIXED_ARCH_KEYS = [
             "input_dim", "feature_dim", "output_dim",
             "batch_norm", "encoder_batch_norm", "decoder_batch_norm",
@@ -117,7 +130,7 @@ implementation:
         ]
         FIXED_TRAINING_KEYS = ["epochs", "early_stopping"]
 
-        print("=== KATIB TUNER V2.0: STARTING ===")
+        print("=== KATIB TUNER V3.5: STARTING ===")
 
         # ── Load Kubernetes config ─────────────────────────────────────
         try:
@@ -144,11 +157,16 @@ implementation:
         parser.add_argument("--max_trial_count",          type=int,   required=True)
         parser.add_argument("--parallel_trial_count",     type=int,   required=True)
         parser.add_argument("--max_failed_trial_count",   type=int,   required=True)
+        parser.add_argument("--namespace",                type=str,   default="admin")
+        parser.add_argument("--cpu_limit",                type=str,   default="1")
+        parser.add_argument("--memory_limit",             type=str,   default="2Gi")
         parser.add_argument("--best_hyperparams",         type=str,   required=True)
         parser.add_argument("--payload",                  type=str,   required=True)
         args = parser.parse_args()
 
-        namespace = "admin"
+        namespace = args.namespace
+        print(f"DEBUG: namespace={namespace}")
+        print(f"DEBUG: cpu_limit={args.cpu_limit} | memory_limit={args.memory_limit}")
 
         import re
         def clean_url(url: str) -> str:
@@ -156,7 +174,6 @@ implementation:
 
         X_data_cdn = clean_url(args.X_data_cdn)
         y_data_cdn = clean_url(args.y_data_cdn)
-        # Treat as not provided if empty, whitespace-only, or sentinel values
         y_cdn_provided = bool(y_data_cdn) and y_data_cdn.lower() not in ("none", "null", "n/a", "na")
         print(f"DEBUG: X_data_cdn (cleaned)={X_data_cdn}")
         print(f"DEBUG: y_data_cdn (cleaned)={y_data_cdn!r}")
@@ -179,7 +196,7 @@ implementation:
 
         # ── Parse parameters_to_tune ───────────────────────────────────
         print("=== DEBUG: PARSING PARAMETERS_TO_TUNE ===")
-        params_input = json.loads(args.parameters_to_tune)
+        params_input  = json.loads(args.parameters_to_tune)
         tunable_names = {p["name"] for p in params_input}
         print(f"DEBUG: {len(params_input)} parameters to tune:")
         for i, p in enumerate(params_input):
@@ -213,7 +230,7 @@ implementation:
         print(f"DEBUG: Experiment name: {experiment_name}")
 
         # ── Objective, algorithm, early stopping ───────────────────────
-        objective_spec = V1beta1ObjectiveSpec(
+        objective_spec      = V1beta1ObjectiveSpec(
             type=args.objective_type,
             goal=args.objective_goal,
             objective_metric_name=args.objective_metric_name
@@ -231,8 +248,7 @@ implementation:
         trial_parameters = []
         trial_args       = []
 
-        # 1. Fixed args from config (not tuned, same for every trial)
-        #    Only add if the key exists in config AND is not being tuned
+        # 1. Fixed args from config
         for key in FIXED_ARCH_KEYS:
             if key in arch and key not in tunable_names:
                 trial_args.extend([f"--{key}", str(arch[key])])
@@ -243,14 +259,11 @@ implementation:
                 trial_args.extend([f"--{key}", str(training[key])])
                 print(f"DEBUG: Fixed training param: {key} = {training[key]}")
 
-        # optimizer name — always pass it, training script needs it
-        # supports both "name" and "optimizer" keys
         optimizer_name = optimizer_config.get("name") or optimizer_config.get("optimizer")
         if optimizer_name and "optimizer" not in tunable_names:
             trial_args.extend(["--optimizer", str(optimizer_name)])
             print(f"DEBUG: Fixed param: optimizer = {optimizer_name}")
 
-        # num_workers from data section
         if "num_workers" in data_config and "num_workers" not in tunable_names:
             trial_args.extend(["--num_workers", str(data_config["num_workers"])])
             print(f"DEBUG: Fixed param: num_workers = {data_config['num_workers']}")
@@ -266,7 +279,7 @@ implementation:
             trial_args.extend([f"--{param_name}", "${trialParameters." + param_name + "}"])
             print(f"  ✓ Tunable param: {param_name}")
 
-        # 3. Dataset CDN URLs — same for every trial
+        # 3. Dataset CDN URLs
         if not X_data_cdn:
             raise ValueError("X_data_cdn is empty — cannot pass --x_path to trial")
         trial_args.extend(["--x_path", X_data_cdn])
@@ -277,7 +290,6 @@ implementation:
         else:
             print("DEBUG: y_data_cdn empty — NOT passed to trial args")
 
-        # Prepend --model so main.py dispatcher routes to correct training script
         full_trial_args = ["--model", model_name] + trial_args
         print(f"DEBUG: Total trial args ({len(full_trial_args)}): {full_trial_args}")
 
@@ -299,12 +311,15 @@ implementation:
                             "containers": [
                                 {
                                     "name":            "training-container",
-                                    "image":           args.docker_image,  # ← from input param
+                                    "image":           args.docker_image,
                                     "imagePullPolicy": "Always",
                                     "command":         ["python", "main.py"],
                                     "args":            full_trial_args,
                                     "resources": {
-                                        "limits": {"cpu": "1", "memory": "2Gi"}
+                                        "limits": {
+                                            "cpu":    args.cpu_limit,
+                                            "memory": args.memory_limit,
+                                        }
                                     }
                                 }
                             ],
@@ -452,6 +467,12 @@ implementation:
       - {inputValue: parallel_trial_count}
       - --max_failed_trial_count
       - {inputValue: max_failed_trial_count}
+      - --namespace
+      - {inputValue: namespace}
+      - --cpu_limit
+      - {inputValue: cpu_limit}
+      - --memory_limit
+      - {inputValue: memory_limit}
       - --best_hyperparams
       - {outputPath: best_hyperparams}
       - --payload
