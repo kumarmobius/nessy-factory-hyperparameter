@@ -1,4 +1,4 @@
-name: NeSy Hyperparameter Tuner V3.4
+name: NeSy Hyperparameter Tuner V3.5
 description: Launches a Katib experiment for NeSy models using config-driven training scripts.
 inputs:
   - name: projectid
@@ -203,7 +203,7 @@ implementation:
                 "fileSystemPath": V1beta1FileSystemPath(
                     path="/katib/mnist.json",
                     kind="File",
-                    format="JSON"
+                    format="TEXT"
                 )
             },
             collector={"kind": "File"}
