@@ -1,4 +1,4 @@
-name: NeSy Hyperparameter Tuner V2.3
+name: NeSy Hyperparameter Tuner V3
 description: Launches a Katib experiment for NeSy models using config-driven training scripts.
 inputs:
   - name: projectid
@@ -17,6 +17,10 @@ inputs:
     type: String
     default: ""
     description: CDN URL of y (labels) dataset — leave empty if not applicable
+
+  - name: docker_image
+    type: String
+    description: Docker image to use for both the component container and each trial pod (e.g., kumar2004/katib-test:5)
 
   - name: parameters_to_tune
     type: Data
@@ -50,12 +54,12 @@ inputs:
     description: Maximum number of trials
 
   - name: parallel_trial_count
-    type: String
+    type: Integer
     default: '2'
     description: Number of trials to run in parallel
 
   - name: max_failed_trial_count
-    type: String
+    type: Integer
     default: '2'
     description: Maximum number of failed trials
 
@@ -70,7 +74,7 @@ outputs:
 
 implementation:
   container:
-    image: kumar2004/katib-test:5
+    image: placeholder  # Overridden at runtime by the docker_image input — see args below
     command:
       - python3
       - -u
@@ -130,6 +134,7 @@ implementation:
         parser.add_argument("--config_json",              type=str,   required=True)
         parser.add_argument("--X_data_cdn",               type=str,   required=True)
         parser.add_argument("--y_data_cdn",               type=str,   default="")
+        parser.add_argument("--docker_image",             type=str,   required=True)
         parser.add_argument("--parameters_to_tune",       type=str,   required=True)
         parser.add_argument("--objective_metric_name",    type=str,   required=True)
         parser.add_argument("--objective_type",           type=str,   required=True)
@@ -154,6 +159,7 @@ implementation:
         y_cdn_provided = y_data_cdn != ""
         print(f"DEBUG: X_data_cdn (cleaned)={X_data_cdn}")
         print(f"DEBUG: y_cdn_provided={y_cdn_provided}")
+        print(f"DEBUG: docker_image={args.docker_image}")
 
         # ── Resolve model name + train script from config ──────────────
         print("=== DEBUG: PARSING CONFIG_JSON ===")
@@ -288,7 +294,7 @@ implementation:
                             "containers": [
                                 {
                                     "name":            "training-container",
-                                    "image":           "kumar2004/katib-test:5",
+                                    "image":           args.docker_image,  # ← from input param
                                     "imagePullPolicy": "Always",
                                     "command":         ["python", "main.py"],
                                     "args":            full_trial_args,
@@ -421,6 +427,8 @@ implementation:
       - {inputValue: X_data_cdn}
       - --y_data_cdn
       - {inputValue: y_data_cdn}
+      - --docker_image
+      - {inputValue: docker_image}
       - --parameters_to_tune
       - {inputValue: parameters_to_tune}
       - --objective_metric_name
