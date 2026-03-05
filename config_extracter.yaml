@@ -6,7 +6,7 @@ inputs:
     description: Original model configuration JSON (nested, with sections like architecture, training, optimizer, data, noise)
 
   - name: best_hyperparams
-    type: JsonArray
+    type: String
     description: Best hyperparameters found by Katib (flat key-value dict)
 
 outputs:
