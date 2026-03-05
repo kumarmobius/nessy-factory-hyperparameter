@@ -1,19 +1,16 @@
-name: Merge Best Hyperparameters into Model Config
+name: Merge Best Hyperparameters into Model Config V1
 description: Replaces tuned parameters in model_config with best_hyperparams from Katib and outputs a unified best_config JSON.
 inputs:
   - name: model_config
     type: String
     description: Original model configuration JSON (nested, with sections like architecture, training, optimizer, data, noise)
-
   - name: best_hyperparams
     type: String
     description: Best hyperparameters found by Katib (flat key-value dict)
-
 outputs:
   - name: best_config
     type: String
     description: Unified model config JSON with best hyperparameters merged in
-
 implementation:
   container:
     image: python:3.10-slim
@@ -27,19 +24,19 @@ implementation:
         import os
 
         parser = argparse.ArgumentParser()
-        parser.add_argument("--model_config",   type=str, required=True)
+        parser.add_argument("--model_config",     type=str, required=True)
         parser.add_argument("--best_hyperparams", type=str, required=True)
-        parser.add_argument("--best_config",    type=str, required=True)
+        parser.add_argument("--best_config",      type=str, required=True)
         args = parser.parse_args()
 
-        # ── Load inputs ───────────────────────────────────────────────
         config      = json.loads(args.model_config)
         best_params = json.loads(args.best_hyperparams)
 
-        print(f"[MergeConfig] Model: {config.get('model', 'unknown')}")
-        print(f"[MergeConfig] Best params to merge: {list(best_params.keys())}")
+        model_name = config.get("model", "unknown")
+        param_keys = list(best_params.keys())
+        print("[MergeConfig] Model: " + model_name)
+        print("[MergeConfig] Best params to merge: " + str(param_keys))
 
-        # ── All nested sections to search through ─────────────────────
         SECTIONS = ["architecture", "training", "optimizer", "data", "noise", "loss"]
 
         merged   = 0
@@ -47,33 +44,30 @@ implementation:
 
         for param_name, param_value in best_params.items():
             placed = False
-
-            # Search each section for the key and replace it
             for section in SECTIONS:
                 if section in config and param_name in config[section]:
                     old_value = config[section][param_name]
                     config[section][param_name] = param_value
-                    print(f"[MergeConfig] {section}.{param_name}: {old_value!r} → {param_value!r}")
+                    print("[MergeConfig] " + section + "." + param_name + ": " + repr(old_value) + " -> " + repr(param_value))
                     placed  = True
                     merged += 1
                     break
-
             if not placed:
-                # Key not found in any section — log it
                 unplaced.append(param_name)
-                print(f"[MergeConfig] WARNING: '{param_name}' not found in any config section — skipping")
+                print("[MergeConfig] WARNING: '" + param_name + "' not found in any config section — skipping")
 
-        print(f"[MergeConfig] Merged {merged} parameter(s) successfully")
+        print("[MergeConfig] Merged " + str(merged) + " parameter(s) successfully")
         if unplaced:
-            print(f"[MergeConfig] Skipped {len(unplaced)} unrecognized param(s): {unplaced}")
+            print("[MergeConfig] Skipped " + str(len(unplaced)) + " unrecognized param(s): " + str(unplaced))
 
-        # ── Write output ──────────────────────────────────────────────
         os.makedirs(os.path.dirname(args.best_config) or ".", exist_ok=True)
         with open(args.best_config, "w") as f:
             json.dump(config, f, indent=2)
 
-        print(f"[MergeConfig] Best config written to: {args.best_config}")
-        print(f"[MergeConfig] Final config:\n{json.dumps(config, indent=2)}")
+        print("[MergeConfig] Best config written to: " + args.best_config)
+        final_config_str = json.dumps(config, indent=2)
+        print("[MergeConfig] Final config:")
+        print(final_config_str)
 
     args:
       - --model_config
