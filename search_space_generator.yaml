@@ -1,4 +1,4 @@
-name: Search Space Generator for Katib V3.1
+name: Search Space Generator for Katib V4
 inputs:
   - {name: model_config, type: String}
   - {name: max_n_layers, type: Integer, optional: true, default: "4"}
@@ -8,7 +8,7 @@ outputs:
 
 implementation:
   container:
-    image: gurpreetgandhi/nesy-factory:vtest4
+    image: kumar2004/katib-test:6
     command:
       - python3
       - -u
@@ -26,8 +26,7 @@ implementation:
         logging.basicConfig(stream=sys.stdout, level=logging.INFO)
         logger = logging.getLogger("search_space_generator")
 
-        # ── Dynamic layer combination generator ───────────────────────
-        UNITS = [16, 32, 64, 128, 256, 512, 1024]
+        UNITS = [16, 32, 64, 128, 256, 512, 1024,2048,4096]
 
         def generate_encoder_dims(max_layers):
             dims_set = set()
@@ -50,6 +49,8 @@ implementation:
         decoder_options        = generate_decoder_dims(max_n)
         logger.info("Encoder/hidden options: %d | Decoder options: %d", len(encoder_hidden_options), len(decoder_options))
 
+        ACTIVATIONS = ["relu", "leaky_relu", "gelu", "tanh", "sigmoid", "elu"]
+
         # ── Param type definitions (keyed by exact config field name) ─
         DOUBLE_PARAMS = {
             "lr":              {"min": "0.00001", "max": "0.1"},
@@ -71,16 +72,36 @@ implementation:
         }
 
         CATEGORICAL_PARAMS = {
-            "activation":        ["relu", "leaky_relu", "gelu", "tanh", "sigmoid", "elu"],
-            "noise_type":        ["gaussian", "salt_pepper", "none"],
-            "weight_init":       ["xavier", "kaiming", "normal", "orthogonal", "xavier_uniform", "kaiming_uniform"],
-            "loss_function":     ["mse", "mseloss", "mae", "huber"],
-            "learning_method":   ["forward_forward", "backprop", "cafo"],
-            "pooling":           ["last", "mean", "max"],
-            "name":              ["adam", "adamw", "sgd", "rmsprop", "adagrad", "adadelta", "adamax"],  # optimizer.name
-            "hidden_dims":       encoder_hidden_options,
-            "encoder_layers":    encoder_hidden_options,
-            "decoder_layers":    decoder_options,
+            # activations — all models
+            "activation":           ACTIVATIONS,
+            "encoder_activation":   ACTIVATIONS,
+            "decoder_activation":   ACTIVATIONS,
+            "output_activation":    ACTIVATIONS + ["none"],
+
+            # noise — VAE, DAE
+            "noise_type":           ["gaussian", "salt_pepper", "zero_masking", "none"],
+
+            # weight init — all models
+            "weight_init":          ["xavier", "kaiming", "normal", "orthogonal", "xavier_uniform", "kaiming_uniform"],
+            "bias_init":            ["zeros", "normal"],
+
+            # loss — all models
+            "loss_function":        ["mse", "mae", "huber"],
+
+            # learning method — RNN, GRU
+            "learning_method":      ["backprop", "forward_forward", "cafo"],
+
+            # RNN/GRU specific
+            "pooling":              ["last", "mean", "max"],
+            "nonlinearity":         ["tanh", "relu"],
+
+            # optimizer — all models (matches --optimizer argparse arg)
+            "optimizer":            ["adam", "adamw", "sgd", "rmsprop", "adagrad", "adadelta", "adamax"],
+
+            # layer dims
+            "hidden_dims":          encoder_hidden_options,
+            "encoder_layers":       encoder_hidden_options,
+            "decoder_layers":       decoder_options,
         }
 
         # Params that are never meaningful to tune
@@ -89,6 +110,7 @@ implementation:
             "num_workers", "input_dim", "feature_dim", "output_dim",
             "batch_norm", "encoder_batch_norm", "decoder_batch_norm",
             "bidirectional", "learn_init_hidden",
+            "sequence_length", "download_dir",
         }
 
         def is_fixed(value):
@@ -165,7 +187,7 @@ implementation:
         for key, val in training.items():
             add(key, val)
 
-        # optimizer section — iterate keys directly, keep original names
+        # optimizer section
         optimizer = config.get("optimizer", {})
         for key, val in optimizer.items():
             add(key, val)
@@ -175,7 +197,7 @@ implementation:
         for key, val in arch.items():
             add(key, val)
 
-        # noise section (top-level, e.g. denoise_ae)
+        # noise section
         noise = config.get("noise", {})
         for key, val in noise.items():
             add(key, val)
