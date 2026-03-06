@@ -1,4 +1,4 @@
-name: NeSy Hyperparameter Tuner V4
+name: NeSy Hyperparameter Tuner V4.1
 description: Launches a Katib experiment for NeSy models using config-driven training scripts.
 inputs:
   - name: projectid
@@ -78,6 +78,11 @@ inputs:
     default: "2Gi"
     description: Memory limit for each trial pod (e.g., "2Gi", "4Gi", "512Mi")
 
+  - name: gpu_limit
+    type: String
+    default: "0"
+    description: Number of GPUs per trial pod. "0" = CPU only, "1" or more = GPU. PyTorch auto-detects at runtime.
+
 outputs:
   - name: best_hyperparams
     type: String
@@ -98,6 +103,7 @@ implementation:
         import argparse
         import json
         import os
+        import re
         import time
         import uuid
         from kubernetes import client, config
@@ -114,30 +120,17 @@ implementation:
             V1beta1FileSystemPath,
         )
 
-        # ── Model → training script mapping ───────────────────────────
-        TRAIN_SCRIPT_MAP = {
-            "denoise_ae": "train_scripts/train_dae.py",
-            "rnn":        "train_scripts/train_rnn.py",
-            "gru":        "train_scripts/train_gru.py",
-            "vae":        "train_scripts/train_vae.py",
-            "mask_ae":    "train_scripts/train_masked_ae.py",
-        }
-
-        FIXED_ARCH_KEYS = [
-            "input_dim", "feature_dim", "output_dim",
-            "batch_norm", "encoder_batch_norm", "decoder_batch_norm",
-            "bidirectional", "learn_init_hidden",
-        ]
+        FIXED_ARCH_KEYS     = ["input_dim", "feature_dim", "output_dim", "batch_norm", "encoder_batch_norm", "decoder_batch_norm", "bidirectional", "learn_init_hidden"]
         FIXED_TRAINING_KEYS = ["epochs", "early_stopping"]
 
-        print("=== KATIB TUNER V3.5: STARTING ===")
+        print("=== KATIB TUNER V4: STARTING ===")
 
         # ── Load Kubernetes config ─────────────────────────────────────
         try:
             config.load_incluster_config()
             print("DEBUG: Loaded in-cluster k8s config")
         except Exception as e:
-            print(f"DEBUG: In-cluster config failed ({e}), trying kube config...")
+            print("DEBUG: In-cluster config failed, trying kube config...")
             config.load_kube_config()
             print("DEBUG: Loaded kube config")
 
@@ -160,59 +153,50 @@ implementation:
         parser.add_argument("--namespace",                type=str,   default="admin")
         parser.add_argument("--cpu_limit",                type=str,   default="1")
         parser.add_argument("--memory_limit",             type=str,   default="2Gi")
+        parser.add_argument("--gpu_limit",                type=str,   default="0")
         parser.add_argument("--best_hyperparams",         type=str,   required=True)
         parser.add_argument("--payload",                  type=str,   required=True)
         args = parser.parse_args()
 
         namespace = args.namespace
-        print(f"DEBUG: namespace={namespace}")
-        print(f"DEBUG: cpu_limit={args.cpu_limit} | memory_limit={args.memory_limit}")
+        gpu_count = int(args.gpu_limit)
+        use_gpu   = gpu_count > 0
+        print("DEBUG: namespace="    + namespace)
+        print("DEBUG: cpu_limit="    + args.cpu_limit)
+        print("DEBUG: memory_limit=" + args.memory_limit)
+        print("DEBUG: gpu_limit="    + args.gpu_limit + " (enabled=" + str(use_gpu) + ")")
 
-        import re
-        def clean_url(url: str) -> str:
+        # ── Clean CDN URLs ─────────────────────────────────────────────
+        def clean_url(url):
             return re.sub(r'\s+', '', url)
 
-        X_data_cdn = clean_url(args.X_data_cdn)
-        y_data_cdn = clean_url(args.y_data_cdn)
+        X_data_cdn     = clean_url(args.X_data_cdn)
+        y_data_cdn     = clean_url(args.y_data_cdn)
         y_cdn_provided = bool(y_data_cdn) and y_data_cdn.lower() not in ("none", "null", "n/a", "na")
-        print(f"DEBUG: X_data_cdn (cleaned)={X_data_cdn}")
-        print(f"DEBUG: y_data_cdn (cleaned)={y_data_cdn!r}")
-        print(f"DEBUG: y_cdn_provided={y_cdn_provided}")
-        print(f"DEBUG: docker_image={args.docker_image}")
+        print("DEBUG: X_data_cdn=" + X_data_cdn)
+        print("DEBUG: y_cdn_provided=" + str(y_cdn_provided))
 
-        # ── Resolve model name + train script from config ──────────────
-        print("=== DEBUG: PARSING CONFIG_JSON ===")
+        # ── Parse model name from config ───────────────────────────────
         config_dict = json.loads(args.config_json)
         model_name  = config_dict.get("model", "").strip().lower()
         if not model_name:
             raise ValueError("'model' key not found in config_json")
-
-        train_script = TRAIN_SCRIPT_MAP.get(model_name)
-        if not train_script:
-            raise ValueError(f"Unknown model '{model_name}'. Supported: {list(TRAIN_SCRIPT_MAP.keys())}")
-
-        print(f"DEBUG: model_name={model_name}")
-        print(f"DEBUG: train_script={train_script}")
+        print("DEBUG: model_name=" + model_name)
 
         # ── Parse parameters_to_tune ───────────────────────────────────
-        print("=== DEBUG: PARSING PARAMETERS_TO_TUNE ===")
         params_input  = json.loads(args.parameters_to_tune)
         tunable_names = {p["name"] for p in params_input}
-        print(f"DEBUG: {len(params_input)} parameters to tune:")
-        for i, p in enumerate(params_input):
-            print(f"  {i+1}. {p.get('name')} [{p.get('parameter_type')}] → {p.get('feasible_space')}")
+        print("DEBUG: " + str(len(params_input)) + " parameters to tune: " + str(list(tunable_names)))
 
         # ── Build Katib parameter specs ────────────────────────────────
-        print("=== DEBUG: CREATING PARAMETER SPECS ===")
         parameters = []
         for p in params_input:
-            param_spec = V1beta1ParameterSpec(
+            parameters.append(V1beta1ParameterSpec(
                 name=p["name"],
                 parameter_type=p["parameter_type"],
                 feasible_space=p["feasible_space"]
-            )
-            parameters.append(param_spec)
-            print(f"  ✓ {p['name']}")
+            ))
+            print("  ✓ param: " + p["name"])
 
         # ── Metrics collector ──────────────────────────────────────────
         metrics_collector = V1beta1MetricsCollectorSpec(
@@ -226,72 +210,74 @@ implementation:
             collector={"kind": "File"}
         )
 
-        experiment_name = f"{model_name.replace('_', '-')}-{str(uuid.uuid4())[:8]}"
-        print(f"DEBUG: Experiment name: {experiment_name}")
+        experiment_name = model_name.replace('_', '-') + "-" + str(uuid.uuid4())[:8]
+        print("DEBUG: experiment_name=" + experiment_name)
 
         # ── Objective, algorithm, early stopping ───────────────────────
-        objective_spec      = V1beta1ObjectiveSpec(
-            type=args.objective_type,
-            goal=args.objective_goal,
-            objective_metric_name=args.objective_metric_name
-        )
+        objective_spec      = V1beta1ObjectiveSpec(type=args.objective_type, goal=args.objective_goal, objective_metric_name=args.objective_metric_name)
         algorithm_spec      = V1beta1AlgorithmSpec(algorithm_name=args.algorithm_name)
         early_stopping_spec = V1beta1EarlyStoppingSpec(algorithm_name=args.early_stopping_algorithm)
 
         # ── Build trial args ───────────────────────────────────────────
-        print("=== DEBUG: BUILDING TRIAL ARGS ===")
         arch             = config_dict.get("architecture", {})
-        training         = config_dict.get("training", {})
-        optimizer_config = config_dict.get("optimizer", {})
-        data_config      = config_dict.get("data", {})
+        training         = config_dict.get("training",     {})
+        optimizer_config = config_dict.get("optimizer",    {})
+        data_config      = config_dict.get("data",         {})
 
         trial_parameters = []
         trial_args       = []
 
-        # 1. Fixed args from config
+        # Fixed arch params
         for key in FIXED_ARCH_KEYS:
             if key in arch and key not in tunable_names:
-                trial_args.extend([f"--{key}", str(arch[key])])
-                print(f"DEBUG: Fixed arch param: {key} = {arch[key]}")
+                trial_args.extend(["--" + key, str(arch[key])])
+                print("DEBUG: fixed arch: " + key + "=" + str(arch[key]))
 
+        # Fixed training params
         for key in FIXED_TRAINING_KEYS:
             if key in training and key not in tunable_names:
-                trial_args.extend([f"--{key}", str(training[key])])
-                print(f"DEBUG: Fixed training param: {key} = {training[key]}")
+                trial_args.extend(["--" + key, str(training[key])])
+                print("DEBUG: fixed training: " + key + "=" + str(training[key]))
 
-        optimizer_name = optimizer_config.get("name") or optimizer_config.get("optimizer")
+        # Fixed optimizer name
+        optimizer_name = optimizer_config.get("optimizer") or optimizer_config.get("name")
         if optimizer_name and "optimizer" not in tunable_names:
             trial_args.extend(["--optimizer", str(optimizer_name)])
-            print(f"DEBUG: Fixed param: optimizer = {optimizer_name}")
+            print("DEBUG: fixed optimizer=" + str(optimizer_name))
 
+        # Fixed num_workers
         if "num_workers" in data_config and "num_workers" not in tunable_names:
             trial_args.extend(["--num_workers", str(data_config["num_workers"])])
-            print(f"DEBUG: Fixed param: num_workers = {data_config['num_workers']}")
+            print("DEBUG: fixed num_workers=" + str(data_config["num_workers"]))
 
-        # 2. Tunable args — injected per trial by Katib
+        # Tunable params — injected by Katib per trial
         for p in params_input:
             param_name = p["name"]
-            trial_parameters.append({
-                "name":        param_name,
-                "description": param_name,
-                "reference":   param_name
-            })
-            trial_args.extend([f"--{param_name}", "${trialParameters." + param_name + "}"])
-            print(f"  ✓ Tunable param: {param_name}")
+            trial_parameters.append({"name": param_name, "description": param_name, "reference": param_name})
+            trial_args.extend(["--" + param_name, "${trialParameters." + param_name + "}"])
 
-        # 3. Dataset CDN URLs
+        # Dataset URLs
         if not X_data_cdn:
             raise ValueError("X_data_cdn is empty — cannot pass --x_path to trial")
         trial_args.extend(["--x_path", X_data_cdn])
-        print(f"DEBUG: x_path={X_data_cdn}")
         if y_cdn_provided:
             trial_args.extend(["--y_path", y_data_cdn])
-            print(f"DEBUG: y_path={y_data_cdn}")
-        else:
-            print("DEBUG: y_data_cdn empty — NOT passed to trial args")
 
+        # main.py receives --model to dispatch to the correct training script
         full_trial_args = ["--model", model_name] + trial_args
-        print(f"DEBUG: Total trial args ({len(full_trial_args)}): {full_trial_args}")
+        print("DEBUG: total trial args=" + str(len(full_trial_args)))
+
+        # ── Build resource limits ──────────────────────────────────────
+        # GPU: only request nvidia.com/gpu if gpu_limit > 0
+        # PyTorch auto-detects cuda at runtime — no extra args needed
+        resource_limits = {
+            "cpu":    args.cpu_limit,
+            "memory": args.memory_limit,
+        }
+        if use_gpu:
+            resource_limits["nvidia.com/gpu"] = str(gpu_count)
+
+        print("DEBUG: resource_limits=" + str(resource_limits))
 
         # ── Trial template ─────────────────────────────────────────────
         trial_template = V1beta1TrialTemplate(
@@ -316,10 +302,8 @@ implementation:
                                     "command":         ["python", "main.py"],
                                     "args":            full_trial_args,
                                     "resources": {
-                                        "limits": {
-                                            "cpu":    args.cpu_limit,
-                                            "memory": args.memory_limit,
-                                        }
+                                        "limits":   resource_limits,
+                                        "requests": resource_limits,
                                     }
                                 }
                             ],
@@ -330,8 +314,7 @@ implementation:
             }
         )
 
-        # ── Create and launch experiment ───────────────────────────────
-        print("=== DEBUG: CREATING EXPERIMENT ===")
+        # ── Create experiment ──────────────────────────────────────────
         experiment_spec = V1beta1ExperimentSpec(
             objective=objective_spec,
             algorithm=algorithm_spec,
@@ -356,30 +339,25 @@ implementation:
             katib_client.create_experiment(experiment)
             print("DEBUG: Experiment created successfully!")
         except Exception as e:
-            print(f"DEBUG: Failed to create experiment: {e}")
-            print(json.dumps(experiment.to_dict(), indent=2, default=str))
+            print("DEBUG: Failed to create experiment: " + str(e))
             raise
 
         # ── Wait for completion ────────────────────────────────────────
-        print("=== DEBUG: WAITING FOR EXPERIMENT COMPLETION ===")
         try:
-            katib_client.wait_for_experiment_condition(
-                name=experiment_name, namespace=namespace, timeout=10800
-            )
+            katib_client.wait_for_experiment_condition(name=experiment_name, namespace=namespace, timeout=10800)
             print("DEBUG: Experiment completed!")
         except Exception as e:
-            print(f"DEBUG: Wait failed: {e}")
+            print("DEBUG: Wait failed: " + str(e))
 
         # ── Collect trial results ──────────────────────────────────────
-        print("=== DEBUG: FETCHING TRIALS ===")
         try:
             trials = katib_client.list_trials(experiment_name, namespace)
-            print(f"DEBUG: Found {len(trials)} trials")
+            print("DEBUG: Found " + str(len(trials)) + " trials")
         except Exception as e:
-            print(f"DEBUG: Failed to list trials: {e}")
+            print("DEBUG: Failed to list trials: " + str(e))
             trials = []
 
-        def auto_cast(value: str):
+        def auto_cast(value):
             if value.lower() in ["true", "false"]:
                 return value.lower() == "true"
             if value.isdigit() or (value.startswith('-') and value[1:].isdigit()):
@@ -393,50 +371,41 @@ implementation:
         for idx, trial in enumerate(trials, start=1):
             trial_data = {
                 "projectId":  args.projectid.strip(),
-                "model_name": f"{model_name}_trial{idx}_{str(uuid.uuid4())[:8]}",
+                "model_name": model_name + "_trial" + str(idx) + "_" + str(uuid.uuid4())[:8],
                 "timestamp":  int(time.time() * 1000),
             }
             if hasattr(trial, "spec") and hasattr(trial.spec, "parameter_assignments"):
                 for param in trial.spec.parameter_assignments:
                     trial_data[param.name] = auto_cast(param.value)
-                    print(f"DEBUG: Trial {idx} | {param.name} = {param.value}")
-
-            if (hasattr(trial, "status") and
-                hasattr(trial.status, "observation") and
-                trial.status.observation and
-                hasattr(trial.status.observation, "metrics") and
+            if (hasattr(trial, "status") and hasattr(trial.status, "observation") and
+                trial.status.observation and hasattr(trial.status.observation, "metrics") and
                 trial.status.observation.metrics):
-                trial_data["metrics_value"] = [
-                    {m.name: auto_cast(m.latest)}
-                    for m in trial.status.observation.metrics
-                ]
+                trial_data["metrics_value"] = [{m.name: auto_cast(m.latest)} for m in trial.status.observation.metrics]
             else:
                 trial_data["metrics_value"] = []
-
             payload_data.append(trial_data)
-            print(f"DEBUG: Trial {idx} → {trial_data}")
+            print("DEBUG: Trial " + str(idx) + " collected")
 
         payload = {"data": payload_data}
         os.makedirs(os.path.dirname(args.payload) or ".", exist_ok=True)
         with open(args.payload, "w") as f:
             json.dump(payload, f)
-        print(f"DEBUG: Payload saved with {len(payload_data)} trial(s)")
+        print("DEBUG: Payload saved with " + str(len(payload_data)) + " trial(s)")
 
         # ── Best hyperparameters ───────────────────────────────────────
-        print("=== DEBUG: GETTING BEST HYPERPARAMETERS ===")
         try:
             best    = katib_client.get_optimal_hyperparameters(name=experiment_name, namespace=namespace)
             hp_dict = {p.name: auto_cast(p.value) for p in best.parameter_assignments} if best and hasattr(best, "parameter_assignments") else {}
-            print(f"DEBUG: Best hyperparameters: {hp_dict}")
+            print("DEBUG: Best hyperparameters: " + str(hp_dict))
         except Exception as e:
-            print(f"DEBUG: Failed to get best hyperparameters: {e}")
+            print("DEBUG: Failed to get best hyperparameters: " + str(e))
             hp_dict = {}
 
         os.makedirs(os.path.dirname(args.best_hyperparams) or ".", exist_ok=True)
         with open(args.best_hyperparams, "w") as f:
             json.dump(hp_dict, f, indent=2)
 
-        print("=== DEBUG: COMPONENT COMPLETED ===")
+        print("=== KATIB TUNER V4: COMPLETED ===")
 
     args:
       - --projectid
@@ -473,6 +442,8 @@ implementation:
       - {inputValue: cpu_limit}
       - --memory_limit
       - {inputValue: memory_limit}
+      - --gpu_limit
+      - {inputValue: gpu_limit}
       - --best_hyperparams
       - {outputPath: best_hyperparams}
       - --payload
