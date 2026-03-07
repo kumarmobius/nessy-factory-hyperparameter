@@ -1,4 +1,4 @@
-name: NeSy Hyperparameter Tuner V4.4
+name: NeSy Hyperparameter Tuner V4.5
 description: Launches a Katib experiment for NeSy models using config-driven training scripts.
 inputs:
   - name: config_json
@@ -387,7 +387,7 @@ implementation:
         payload = {"data": payload_data}
         os.makedirs(os.path.dirname(args.payload) or ".", exist_ok=True)
         with open(args.payload, "w") as f:
-            json.dump(payload, f)
+            json.dump(payload_data, f)
         print("DEBUG: Payload saved with " + str(len(payload_data)) + " trial(s)")
 
         # ── Build schema_json ──────────────────────────────────────────
@@ -415,7 +415,7 @@ implementation:
 
         os.makedirs(os.path.dirname(args.schema_json) or ".", exist_ok=True)
         with open(args.schema_json, "w") as f:
-            json.dump({"data": schema_data}, f, indent=2)
+            json.dump(schema_data, f, indent=2)
         print("DEBUG: schema_json saved with " + str(len(schema_data)) + " row(s)")
 
         # ── Best hyperparameters ───────────────────────────────────────
