@@ -1,10 +1,6 @@
-name: NeSy Hyperparameter Tuner V4.3
+name: NeSy Hyperparameter Tuner V4.4
 description: Launches a Katib experiment for NeSy models using config-driven training scripts.
 inputs:
-  - name: projectid
-    type: String
-    description: Name or ID of the use case
-
   - name: config_json
     type: String
     description: Full model configuration JSON (model name is read from here)
@@ -140,7 +136,6 @@ implementation:
 
         # ── Parse arguments ────────────────────────────────────────────
         parser = argparse.ArgumentParser()
-        parser.add_argument("--projectid",                type=str,   required=True)
         parser.add_argument("--config_json",              type=str,   required=True)
         parser.add_argument("--X_data_cdn",               type=str,   required=True)
         parser.add_argument("--y_data_cdn",               type=str,   default="")
@@ -373,7 +368,6 @@ implementation:
         payload_data = []
         for idx, trial in enumerate(trials, start=1):
             trial_data = {
-                "projectId":  args.projectid.strip(),
                 "model_name": model_name + "_trial" + str(idx) + "_" + str(uuid.uuid4())[:8],
                 "timestamp":  int(time.time() * 1000),
             }
@@ -402,14 +396,13 @@ implementation:
         # metrics_value = [{"val_loss": 0.048607}] from trial observation
         # timestamp     = current time in milliseconds
         # all hyperparams stored as top-level keys to match HPT schema
-        SCHEMA_SKIP_KEYS = {"projectId", "model_name", "model_type", "timestamp", "metrics_value"}
+        SCHEMA_SKIP_KEYS = {"model_name", "model_type", "timestamp", "metrics_value"}
         schema_data = []
         for trial_row in payload_data:
             schema_row = {}
             # Identity fields
             schema_row["model_name"]    = experiment_name        # katib experiment name
             schema_row["model_type"]    = model_name             # denoise_ae / vae / gru etc.
-            schema_row["projectId"]     = args.projectid.strip()
             schema_row["timestamp"]     = int(time.time() * 1000)
             # All hyperparams as top-level keys
             for k, v in trial_row.items():
@@ -441,8 +434,6 @@ implementation:
         print("=== KATIB TUNER V4: COMPLETED ===")
 
     args:
-      - --projectid
-      - {inputValue: projectid}
       - --config_json
       - {inputValue: config_json}
       - --X_data_cdn
