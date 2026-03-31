@@ -1,4 +1,4 @@
-name: Search Space Generator for Katib V5
+name: Search Space Generator for Katib V5.1
 inputs:
   - {name: model_config, type: String}
   - {name: max_n_layers, type: Integer, optional: true, default: "4"}
@@ -91,6 +91,8 @@ implementation:
             "weight_concentration_prior":   {"min": "0.001",    "max": "1.0"},
             "mean_precision_prior":         {"min": "0.001",    "max": "1.0"},
             "degrees_of_freedom_prior":     {"min": "1.0",      "max": "100.0"},
+            "m":     {"min": "1.1", "max": "4.0"},
+            "error": {"min": "0.000001", "max": "0.001"},
         }
 
         INT_PARAMS = {
@@ -180,6 +182,7 @@ implementation:
             # ── Other clustering ───────────────────────────────────── #
             "bin_seeding",      # bool flag — not meaningful to tune
             "cluster_all",      # bool flag — not meaningful to tune
+            "init",
         }
 
         # Params that must always use generated dim combinations,
