@@ -1,4 +1,4 @@
-name: Search Space Generator for Katib V4
+name: Search Space Generator for Katib V5
 inputs:
   - {name: model_config, type: String}
   - {name: max_n_layers, type: Integer, optional: true, default: "4"}
@@ -26,7 +26,7 @@ implementation:
         logging.basicConfig(stream=sys.stdout, level=logging.INFO)
         logger = logging.getLogger("search_space_generator")
 
-        UNITS = [16, 32, 64, 128, 256, 512, 1024,2048,4096]
+        UNITS = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
 
         def generate_encoder_dims(max_layers):
             dims_set = set()
@@ -47,71 +47,144 @@ implementation:
         max_n = args.max_n_layers
         encoder_hidden_options = generate_encoder_dims(max_n)
         decoder_options        = generate_decoder_dims(max_n)
-        logger.info("Encoder/hidden options: %d | Decoder options: %d", len(encoder_hidden_options), len(decoder_options))
+        logger.info("Encoder/hidden options: %d | Decoder options: %d",
+                    len(encoder_hidden_options), len(decoder_options))
 
         ACTIVATIONS = ["relu", "leaky_relu", "gelu", "tanh", "sigmoid", "elu"]
 
-        # ── Param type definitions (keyed by exact config field name) ─
+        # ── Param type definitions ─────────────────────────────────────
         DOUBLE_PARAMS = {
-            "lr":              {"min": "0.00001", "max": "0.1"},
-            "learning_rate":   {"min": "0.00001", "max": "0.1"},
-            "weight_decay":    {"min": "0.000001", "max": "0.01"},
-            "dropout":         {"min": "0.01",     "max": "0.5"},
-            "encoder_dropout": {"min": "0.01",     "max": "0.5"},
-            "decoder_dropout": {"min": "0.01",     "max": "0.5"},
-            "noise_factor":    {"min": "0.05",     "max": "0.5"},
-            "momentum":        {"min": "0.8",      "max": "0.99"},
-            "grad_clip":       {"min": "0.1",      "max": "10.0"},
-            "beta":            {"min": "0.1",      "max": "5.0"},
-            "val_split":       {"min": "0.1",      "max": "0.3"},
+            # ── Deep learning ──────────────────────────────────────── #
+            "lr":                           {"min": "0.00001",  "max": "0.1"},
+            "learning_rate":                {"min": "0.00001",  "max": "0.1"},
+            "weight_decay":                 {"min": "0.000001", "max": "0.01"},
+            "dropout":                      {"min": "0.01",     "max": "0.5"},
+            "encoder_dropout":              {"min": "0.01",     "max": "0.5"},
+            "decoder_dropout":              {"min": "0.01",     "max": "0.5"},
+            "noise_factor":                 {"min": "0.05",     "max": "0.5"},
+            "momentum":                     {"min": "0.8",      "max": "0.99"},
+            "grad_clip":                    {"min": "0.1",      "max": "10.0"},
+            "beta":                         {"min": "0.1",      "max": "5.0"},
+            "val_split":                    {"min": "0.1",      "max": "0.3"},
+
+            # ── Centroid clustering ────────────────────────────────── #
+            "tol":                          {"min": "0.00001",  "max": "0.01"},
+            "reassignment_ratio":           {"min": "0.001",    "max": "0.1"},
+
+            # ── Density clustering ─────────────────────────────────── #
+            "eps":                          {"min": "0.1",      "max": "5.0"},
+            "xi":                           {"min": "0.01",     "max": "0.5"},
+            "min_cluster_size_optics":      {"min": "0.01",     "max": "0.5"},
+            "cluster_selection_epsilon":    {"min": "0.0",      "max": "5.0"},
+            "alpha":                        {"min": "0.5",      "max": "2.0"},
+
+            # ── Hierarchical clustering ────────────────────────────── #
+            "threshold":                    {"min": "0.1",      "max": "2.0"},
+
+            # ── Other clustering ───────────────────────────────────── #
+            "bandwidth":                    {"min": "0.1",      "max": "10.0"},
+            "damping":                      {"min": "0.5",      "max": "0.99"},
+            "preference":                   {"min": "-100.0",   "max": "0.0"},
+
+            # ── GMM clustering ─────────────────────────────────────── #
+            "reg_covar":                    {"min": "0.0000001", "max": "0.001"},
+            "weight_concentration_prior":   {"min": "0.001",    "max": "1.0"},
+            "mean_precision_prior":         {"min": "0.001",    "max": "1.0"},
+            "degrees_of_freedom_prior":     {"min": "1.0",      "max": "100.0"},
         }
 
         INT_PARAMS = {
-            "batch_size": {"min": "16",  "max": "128"},
-            "latent_dim": {"min": "4",   "max": "64"},
+            # ── Deep learning ──────────────────────────────────────── #
+            "batch_size":           {"min": "16",  "max": "128"},
+            "latent_dim":           {"min": "4",   "max": "64"},
+
+            # ── Centroid / hierarchical / other / GMM ─────────────── #
+            "n_clusters":           {"min": "2",   "max": "20"},
+            "n_clusters_birch":     {"min": "2",   "max": "20"},
+            "n_components":         {"min": "2",   "max": "20"},
+            "max_iter":             {"min": "100", "max": "1000"},
+            "max_iter_ap":          {"min": "100", "max": "500"},
+            "n_init":               {"min": "1",   "max": "20"},
+            "branching_factor":     {"min": "20",  "max": "100"},
+            "convergence_iter":     {"min": "5",   "max": "30"},
+            "n_neighbors":          {"min": "5",   "max": "30"},
+            "min_bin_freq":         {"min": "1",   "max": "10"},
+
+            # ── Density clustering ─────────────────────────────────── #
+            "min_samples":          {"min": "2",   "max": "50"},
+            "min_cluster_size":     {"min": "2",   "max": "50"},
+            "min_samples_hdbscan":  {"min": "2",   "max": "50"},
         }
 
         CATEGORICAL_PARAMS = {
-            # activations — all models
+            # ── Deep learning activations ──────────────────────────── #
             "activation":           ACTIVATIONS,
             "encoder_activation":   ACTIVATIONS,
             "decoder_activation":   ACTIVATIONS,
             "output_activation":    ACTIVATIONS + ["none"],
 
-            # noise — VAE, DAE
+            # ── Deep learning misc ─────────────────────────────────── #
             "noise_type":           ["gaussian", "salt_pepper", "zero_masking", "none"],
-
-            # weight init — all models
-            "weight_init":          ["xavier", "kaiming", "normal", "orthogonal", "xavier_uniform", "kaiming_uniform"],
+            "weight_init":          ["xavier", "kaiming", "normal", "orthogonal",
+                                     "xavier_uniform", "kaiming_uniform"],
             "bias_init":            ["zeros", "normal"],
-
-            # loss — all models
             "loss_function":        ["mse", "mae", "huber"],
-
-            # learning method — RNN, GRU
             "learning_method":      ["backprop", "forward_forward", "cafo"],
-
-            # RNN/GRU specific
             "pooling":              ["last", "mean", "max"],
             "nonlinearity":         ["tanh", "relu"],
+            "optimizer":            ["adam", "adamw", "sgd", "rmsprop",
+                                     "adagrad", "adadelta", "adamax"],
 
-            # optimizer — all models (matches --optimizer argparse arg)
-            "optimizer":            ["adam", "adamw", "sgd", "rmsprop", "adagrad", "adadelta", "adamax"],
-
-            # layer dims
+            # ── Layer dims ─────────────────────────────────────────── #
             "hidden_dims":          encoder_hidden_options,
             "encoder_layers":       encoder_hidden_options,
             "decoder_layers":       decoder_options,
+
+            # ── Centroid clustering ────────────────────────────────── #
+            "init":                 ["k-means++", "random"],
+            "bisecting_strategy":   ["biggest_inertia", "largest_cluster"],
+            "method":               ["alternate", "pam"],
+
+            # ── Density clustering ─────────────────────────────────── #
+            "metric":               ["euclidean", "manhattan", "cosine"],
+            "cluster_method":       ["xi", "dbscan"],
+            "cluster_selection_method": ["eom", "leaf"],
+
+            # ── Hierarchical clustering ────────────────────────────── #
+            "linkage":              ["ward", "complete", "average", "single"],
+            "compute_full_tree":    ["auto", "true", "false"],
+
+            # ── Other clustering ───────────────────────────────────── #
+            "affinity":             ["rbf", "nearest_neighbors", "cosine"],
+            "assign_labels":        ["kmeans", "discretize", "cluster_qr"],
+
+            # ── GMM clustering ─────────────────────────────────────── #
+            "covariance_type":      ["full", "tied", "diag", "spherical"],
+            "init_params":          ["kmeans", "k-means++", "random", "random_from_data"],
+            "weight_concentration_prior_type": ["dirichlet_process",
+                                                "dirichlet_distribution"],
         }
 
-        # Params that are never meaningful to tune
+        # Params never meaningful to tune
         SKIP_PARAMS = {
+            # ── Deep learning ──────────────────────────────────────── #
             "epochs", "early_stopping", "save_path", "data_path",
             "num_workers", "input_dim", "feature_dim", "output_dim",
             "batch_norm", "encoder_batch_norm", "decoder_batch_norm",
             "bidirectional", "learn_init_hidden",
             "sequence_length", "download_dir",
+            # ── Clustering (shared) ────────────────────────────────── #
+            "random_state", "n_jobs", "sample_size", "x_path",
+            # ── Density clustering ─────────────────────────────────── #
+            "max_eps",          # np.inf — not range-tunable
+            # ── Other clustering ───────────────────────────────────── #
+            "bin_seeding",      # bool flag — not meaningful to tune
+            "cluster_all",      # bool flag — not meaningful to tune
         }
+
+        # Params that must always use generated dim combinations,
+        # even if the config supplies a list of unit values
+        DIM_PARAMS = {"hidden_dims", "encoder_layers", "decoder_layers"}
 
         def is_fixed(value):
             return isinstance(value, list) and len(value) == 1
@@ -128,8 +201,9 @@ implementation:
                 logger.info("Skipping (fixed): %s = %s", name, value)
                 return None
 
-            # User gave explicit list of choices
-            if is_tunable_list(value):
+            # User gave explicit list of choices —
+            # skip for DIM_PARAMS: must always use generated combinations
+            if is_tunable_list(value) and name not in DIM_PARAMS:
                 return {
                     "name": name,
                     "parameter_type": "categorical",
@@ -160,7 +234,7 @@ implementation:
             logger.warning("Unknown param '%s' (value=%s) — skipping.", name, value)
             return None
 
-        # ── Parse config ──────────────────────────────────────────────
+        # ── Parse config ───────────────────────────────────────────────
         config = json.loads(args.model_config)
         logger.info("Building search space for model: %s", config.get("model", "unknown"))
 
@@ -177,41 +251,16 @@ implementation:
                 search_space.append(p)
                 seen.add(name)
 
-        # data section
-        data = config.get("data", {})
-        for key, val in data.items():
-            add(key, val)
-
-        # training section
-        training = config.get("training", {})
-        for key, val in training.items():
-            add(key, val)
-
-        # optimizer section
-        optimizer = config.get("optimizer", {})
-        for key, val in optimizer.items():
-            add(key, val)
-
-        # architecture section
-        arch = config.get("architecture", {})
-        for key, val in arch.items():
-            add(key, val)
-
-        # noise section
-        noise = config.get("noise", {})
-        for key, val in noise.items():
-            add(key, val)
-
-        # loss section
-        loss = config.get("loss", {})
-        for key, val in loss.items():
-            add(key, val)
+        for section in ["data", "training", "optimizer", "architecture",
+                        "noise", "loss", "clustering"]:
+            for key, val in config.get(section, {}).items():
+                add(key, val)
 
         logger.info("Final search space: %d parameters.", len(search_space))
         for p in search_space:
             fs = p["feasible_space"]
             display = f"[{len(fs['list'])} options]" if "list" in fs else fs
-            logger.info("  → %-20s %-12s %s", p["name"], p["parameter_type"], display)
+            logger.info("  → %-30s %-12s %s", p["name"], p["parameter_type"], display)
 
         os.makedirs(os.path.dirname(args.search_space) or ".", exist_ok=True)
         with open(args.search_space, "w") as f:
