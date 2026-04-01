@@ -1,4 +1,4 @@
-name: NeSy Hyperparameter Tuner V5
+name: NeSy Hyperparameter Tuner V5.1
 description: Launches a Katib experiment for NeSy models using config-driven training scripts.
 inputs:
   - name: config_json
@@ -288,11 +288,6 @@ implementation:
         #      true          → tunable → skip here (Katib injects)
         #      false / null  → skip entirely
         def extract_fixed_value(val):
-            """
-            Returns (should_pass, cli_value) tuple.
-            should_pass=True  → add to trial_args as fixed
-            should_pass=False → skip (tunable or meaningless)
-            """
             if val is None:
                 return False, None
             if isinstance(val, bool):
