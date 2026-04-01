@@ -1,4 +1,4 @@
-name: Search Space Generator for Katib V6.2
+name: Search Space Generator for Katib V7
 inputs:
   - {name: model_config, type: String}
   - {name: max_n_layers, type: Integer, optional: true, default: "4"}
@@ -92,8 +92,8 @@ implementation:
             "error":                        {"min": "0.000001", "max": "0.001"},
             # ── Regression / SVM ──────────────────────────────────── #
             "C":                            {"min": "0.001",    "max": "100.0"},
-            "l1_ratio":                     {"min": "0.0",      "max": "1.0"},
-            "coef0":                        {"min": "0.0",      "max": "10.0"},
+            "l1_ratio":                     {"min": "0.01",      "max": "1.0"},
+            "coef0":                        {"min": "1.0",      "max": "10.0"},
             "nu":                           {"min": "0.1",      "max": "0.9"},
             "epsilon":                      {"min": "0.01",     "max": "1.0"},
             "intercept_scaling":            {"min": "0.1",      "max": "10.0"},
