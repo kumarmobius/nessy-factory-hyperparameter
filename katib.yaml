@@ -1,4 +1,4 @@
-name: NeSy Hyperparameter Tuner V4.6
+name: NeSy Hyperparameter Tuner V5
 description: Launches a Katib experiment for NeSy models using config-driven training scripts.
 inputs:
   - name: config_json
@@ -24,7 +24,7 @@ inputs:
 
   - name: objective_metric_name
     type: String
-    description: Metric name Katib will optimize (e.g., val_loss, accuracy, f1_score)
+    description: Metric name Katib will optimize (e.g., val_loss, accuracy, f1_score, metric, silhouette_score)
 
   - name: objective_type
     type: String
@@ -77,7 +77,7 @@ inputs:
   - name: gpu_limit
     type: String
     default: "0"
-    description: Number of GPUs per trial pod. "0" = CPU only, "1" or more = GPU. PyTorch auto-detects at runtime.
+    description: Number of GPUs per trial pod. "0" = CPU only, "1" or more = GPU.
 
 outputs:
   - name: best_hyperparams
@@ -90,11 +90,11 @@ outputs:
 
   - name: schema_json
     type: String
-    description: Trial results formatted to match HPT schema (model_name=katib experiment name, model_type from config, metrics_value as json array)
+    description: Trial results formatted to match HPT schema
 
 implementation:
   container:
-    image: kumar2004/katib-test:6
+    image: kumar2004/katib-test:14
     command:
       - python3
       - -u
@@ -120,10 +120,24 @@ implementation:
             V1beta1FileSystemPath,
         )
 
-        FIXED_ARCH_KEYS     = ["input_dim", "feature_dim", "output_dim", "batch_norm", "encoder_batch_norm", "decoder_batch_norm", "bidirectional", "learn_init_hidden"]
+        # ── Keys handled explicitly — not via generic extra_sections loop ──
+        FIXED_ARCH_KEYS     = [
+            "input_dim", "feature_dim", "output_dim",
+            "batch_norm", "encoder_batch_norm", "decoder_batch_norm",
+            "bidirectional", "learn_init_hidden",
+        ]
         FIXED_TRAINING_KEYS = ["epochs", "early_stopping"]
 
-        print("=== KATIB TUNER V4.5: STARTING ===")
+        # ── Sections handled explicitly — excluded from generic loop ───
+        KNOWN_SECTIONS = {
+            "architecture", "training", "optimizer",
+            "data", "noise", "loss", "model",
+        }
+
+        # ── Params never passed as CLI args ────────────────────────────
+        SKIP_FIXED = {"save_path", "x_path", "y_path"}
+
+        print("=== KATIB TUNER V5: STARTING ===")
 
         # ── Load Kubernetes config ─────────────────────────────────────
         try:
@@ -172,11 +186,14 @@ implementation:
 
         X_data_cdn     = clean_url(args.X_data_cdn)
         y_data_cdn     = clean_url(args.y_data_cdn)
-        y_cdn_provided = bool(y_data_cdn) and y_data_cdn.lower() not in ("none", "null", "n/a", "na")
+        y_cdn_provided = (
+            bool(y_data_cdn) and
+            y_data_cdn.lower() not in ("none", "null", "n/a", "na", "")
+        )
         print("DEBUG: X_data_cdn=" + X_data_cdn)
         print("DEBUG: y_cdn_provided=" + str(y_cdn_provided))
 
-        # ── Parse model name from config ───────────────────────────────
+        # ── Parse config ───────────────────────────────────────────────
         config_dict = json.loads(args.config_json)
         model_name  = config_dict.get("model", "").strip().lower()
         if not model_name:
@@ -194,7 +211,7 @@ implementation:
             parameters.append(V1beta1ParameterSpec(
                 name=p["name"],
                 parameter_type=p["parameter_type"],
-                feasible_space=p["feasible_space"]
+                feasible_space=p["feasible_space"],
             ))
             print("  ✓ param: " + p["name"])
 
@@ -204,77 +221,136 @@ implementation:
                 "fileSystemPath": V1beta1FileSystemPath(
                     path="/katib/mnist.json",
                     kind="File",
-                    format="TEXT"
+                    format="TEXT",
                 )
             },
-            collector={"kind": "File"}
+            collector={"kind": "File"},
         )
 
-        experiment_name = model_name.replace('_', '-') + "-" + str(uuid.uuid4())[:8]
+        experiment_name = model_name.replace("_", "-") + "-" + str(uuid.uuid4())[:8]
         print("DEBUG: experiment_name=" + experiment_name)
 
-        # ── Objective, algorithm, early stopping ───────────────────────
-        objective_spec      = V1beta1ObjectiveSpec(type=args.objective_type, goal=args.objective_goal, objective_metric_name=args.objective_metric_name)
+        # ── Objective / algorithm / early stopping ─────────────────────
+        objective_spec      = V1beta1ObjectiveSpec(
+            type=args.objective_type,
+            goal=args.objective_goal,
+            objective_metric_name=args.objective_metric_name,
+        )
         algorithm_spec      = V1beta1AlgorithmSpec(algorithm_name=args.algorithm_name)
         early_stopping_spec = V1beta1EarlyStoppingSpec(algorithm_name=args.early_stopping_algorithm)
 
-        # ── Build trial args ───────────────────────────────────────────
+        # ── Pull config sections ───────────────────────────────────────
         arch             = config_dict.get("architecture", {})
         training         = config_dict.get("training",     {})
         optimizer_config = config_dict.get("optimizer",    {})
         data_config      = config_dict.get("data",         {})
 
+        # ── Collect all extra sections (svm, regression, knn,
+        #    clustering, etc.) into a single flat dict ──────────────────
+        extra_sections = {}
+        for section_key, section_val in config_dict.items():
+            if section_key not in KNOWN_SECTIONS and isinstance(section_val, dict):
+                extra_sections.update(section_val)
+                print("DEBUG: loaded extra section: " + section_key +
+                      " (" + str(len(section_val)) + " keys)")
+
         trial_parameters = []
         trial_args       = []
 
-        # Fixed arch params
+        # ── 1. Fixed architecture params ───────────────────────────────
         for key in FIXED_ARCH_KEYS:
             if key in arch and key not in tunable_names:
                 trial_args.extend(["--" + key, str(arch[key])])
                 print("DEBUG: fixed arch: " + key + "=" + str(arch[key]))
 
-        # Fixed training params
+        # ── 2. Fixed training params ───────────────────────────────────
         for key in FIXED_TRAINING_KEYS:
             if key in training and key not in tunable_names:
                 trial_args.extend(["--" + key, str(training[key])])
                 print("DEBUG: fixed training: " + key + "=" + str(training[key]))
 
-        # Fixed optimizer name
+        # ── 3. Fixed optimizer name ────────────────────────────────────
         optimizer_name = optimizer_config.get("optimizer") or optimizer_config.get("name")
         if optimizer_name and "optimizer" not in tunable_names:
             trial_args.extend(["--optimizer", str(optimizer_name)])
             print("DEBUG: fixed optimizer=" + str(optimizer_name))
 
-        # Fixed num_workers
+        # ── 4. Fixed num_workers ───────────────────────────────────────
         if "num_workers" in data_config and "num_workers" not in tunable_names:
             trial_args.extend(["--num_workers", str(data_config["num_workers"])])
             print("DEBUG: fixed num_workers=" + str(data_config["num_workers"]))
 
-        # Tunable params — injected by Katib per trial
+        # ── 5. Fixed params from all other sections ────────────────────
+        #    Rules (mirror of search space generator):
+        #      scalar value  → pass as fixed CLI arg
+        #      [x]           → single list = fixed → pass that value as CLI arg
+        #      [x, y, ...]   → multiple list = tunable → skip here (Katib injects)
+        #      true          → tunable → skip here (Katib injects)
+        #      false / null  → skip entirely
+        def extract_fixed_value(val):
+            """
+            Returns (should_pass, cli_value) tuple.
+            should_pass=True  → add to trial_args as fixed
+            should_pass=False → skip (tunable or meaningless)
+            """
+            if val is None:
+                return False, None
+            if isinstance(val, bool):
+                # true  = tunable flag (Katib handles)
+                # false = skip
+                return False, None
+            if isinstance(val, list):
+                if len(val) == 1:
+                    # single list = fixed
+                    return True, str(val[0])
+                else:
+                    # multiple list = tunable (Katib handles)
+                    return False, None
+            # raw scalar (int / float / str)
+            return True, str(val)
+
+        for key, val in extra_sections.items():
+            if key in tunable_names:
+                continue    # Katib will inject this
+            if key in SKIP_FIXED:
+                continue
+            should_pass, cli_value = extract_fixed_value(val)
+            if should_pass:
+                trial_args.extend(["--" + key, cli_value])
+                print("DEBUG: fixed extra: " + key + "=" + cli_value)
+            else:
+                print("DEBUG: skipping extra (tunable/null/bool): " + key)
+
+        # ── 6. Tunable params — injected by Katib per trial ───────────
         for p in params_input:
             param_name = p["name"]
-            trial_parameters.append({"name": param_name, "description": param_name, "reference": param_name})
-            trial_args.extend(["--" + param_name, "${trialParameters." + param_name + "}"])
+            trial_parameters.append({
+                "name":        param_name,
+                "description": param_name,
+                "reference":   param_name,
+            })
+            trial_args.extend(["--" + param_name,
+                                "${trialParameters." + param_name + "}"])
+            print("DEBUG: tunable: " + param_name)
 
-        # Dataset URLs
+        # ── 7. Dataset URLs ────────────────────────────────────────────
         if not X_data_cdn:
             raise ValueError("X_data_cdn is empty — cannot pass --x_path to trial")
         trial_args.extend(["--x_path", X_data_cdn])
         if y_cdn_provided:
             trial_args.extend(["--y_path", y_data_cdn])
 
-        # main.py receives --model to dispatch to the correct training script
         full_trial_args = ["--model", model_name] + trial_args
         print("DEBUG: total trial args=" + str(len(full_trial_args)))
+        print("DEBUG: full_trial_args=" + str(full_trial_args))
 
-        # ── Build resource limits ──────────────────────────────────────
+        # ── Resource limits ────────────────────────────────────────────
         resource_limits = {
             "cpu":    args.cpu_limit,
             "memory": args.memory_limit,
         }
         if use_gpu:
             resource_limits["nvidia.com/gpu"] = str(gpu_count)
-
         print("DEBUG: resource_limits=" + str(resource_limits))
 
         # ── Trial template ─────────────────────────────────────────────
@@ -302,14 +378,14 @@ implementation:
                                     "resources": {
                                         "limits":   resource_limits,
                                         "requests": resource_limits,
-                                    }
+                                    },
                                 }
                             ],
-                            "restartPolicy": "Never"
+                            "restartPolicy": "Never",
                         }
                     }
                 }
-            }
+            },
         )
 
         # ── Create experiment ──────────────────────────────────────────
@@ -322,7 +398,7 @@ implementation:
             max_trial_count=args.max_trial_count,
             parallel_trial_count=args.parallel_trial_count,
             max_failed_trial_count=args.max_failed_trial_count,
-            early_stopping=early_stopping_spec
+            early_stopping=early_stopping_spec,
         )
 
         katib_client = katib.KatibClient(namespace=namespace)
@@ -330,7 +406,7 @@ implementation:
             api_version="kubeflow.org/v1beta1",
             kind="Experiment",
             metadata=client.V1ObjectMeta(name=experiment_name, namespace=namespace),
-            spec=experiment_spec
+            spec=experiment_spec,
         )
 
         try:
@@ -342,7 +418,11 @@ implementation:
 
         # ── Wait for completion ────────────────────────────────────────
         try:
-            katib_client.wait_for_experiment_condition(name=experiment_name, namespace=namespace, timeout=10800)
+            katib_client.wait_for_experiment_condition(
+                name=experiment_name,
+                namespace=namespace,
+                timeout=10800,
+            )
             print("DEBUG: Experiment completed!")
         except Exception as e:
             print("DEBUG: Wait failed: " + str(e))
@@ -356,28 +436,37 @@ implementation:
             trials = []
 
         def auto_cast(value):
-            if value.lower() in ["true", "false"]:
-                return value.lower() == "true"
-            if value.isdigit() or (value.startswith('-') and value[1:].isdigit()):
-                return int(value)
-            try:
-                return float(value)
-            except ValueError:
-                return value
+            if isinstance(value, str):
+                if value.lower() in ["true", "false"]:
+                    return value.lower() == "true"
+                if value.isdigit() or (value.startswith("-") and value[1:].isdigit()):
+                    return int(value)
+                try:
+                    return float(value)
+                except ValueError:
+                    return value
+            return value
 
         payload_data = []
         for idx, trial in enumerate(trials, start=1):
             trial_data = {
                 "model_name": model_name + "_trial" + str(idx) + "_" + str(uuid.uuid4())[:8],
-                "timestamp":  int(time.time() * 1000) + idx,  # unique per trial
+                "timestamp":  int(time.time() * 1000) + idx,
             }
             if hasattr(trial, "spec") and hasattr(trial.spec, "parameter_assignments"):
                 for param in trial.spec.parameter_assignments:
                     trial_data[param.name] = auto_cast(param.value)
-            if (hasattr(trial, "status") and hasattr(trial.status, "observation") and
-                trial.status.observation and hasattr(trial.status.observation, "metrics") and
-                trial.status.observation.metrics):
-                trial_data["metrics_value"] = [{m.name: auto_cast(m.latest)} for m in trial.status.observation.metrics]
+            if (
+                hasattr(trial, "status") and
+                hasattr(trial.status, "observation") and
+                trial.status.observation and
+                hasattr(trial.status.observation, "metrics") and
+                trial.status.observation.metrics
+            ):
+                trial_data["metrics_value"] = [
+                    {m.name: auto_cast(m.latest)}
+                    for m in trial.status.observation.metrics
+                ]
             else:
                 trial_data["metrics_value"] = []
             payload_data.append(trial_data)
@@ -386,32 +475,26 @@ implementation:
         # ── Save payload ───────────────────────────────────────────────
         os.makedirs(os.path.dirname(args.payload) or ".", exist_ok=True)
         with open(args.payload, "w") as f:
-            json.dump(payload_data, f)
+            json.dump(payload_data, f, indent=2)
         print("DEBUG: Payload saved with " + str(len(payload_data)) + " trial(s)")
 
         # ── Build schema_json ──────────────────────────────────────────
-        # model_name    = experiment_name + _trial{idx} + _uuid (unique per row)
-        # model_type    = raw model key from config_json (e.g. denoise_ae, vae, gru)
-        # timestamp     = unique per row (base_ms + idx offset)
-        # metrics_value = [{"val_loss": 0.048607}] from trial observation
-        # all hyperparams stored as top-level keys to match HPT schema
         SCHEMA_SKIP_KEYS = {"model_name", "model_type", "timestamp", "metrics_value"}
-        base_ts = int(time.time() * 1000)
+        base_ts     = int(time.time() * 1000)
         schema_data = []
         for idx, trial_row in enumerate(payload_data, start=1):
             schema_row = {}
-            # Unique model_name: denoise-ae-abd0c60b_trial1_6aee0c88
             schema_row["model_name"]    = experiment_name + "_trial" + str(idx) + "_" + str(uuid.uuid4())[:8]
-            schema_row["model_type"]    = model_name             # denoise_ae / vae / gru etc.
-            schema_row["timestamp"]     = base_ts + idx          # unique per row — prevents primary key clash
-            # All hyperparams as top-level keys
+            schema_row["model_type"]    = model_name
+            schema_row["timestamp"]     = base_ts + idx
             for k, v in trial_row.items():
                 if k not in SCHEMA_SKIP_KEYS:
                     schema_row[k] = v
-            # metrics_value already in [{"val_loss": 0.048607}] format
             schema_row["metrics_value"] = trial_row.get("metrics_value", [])
             schema_data.append(schema_row)
-            print("DEBUG: schema_row " + str(idx) + " → model_name=" + schema_row["model_name"] + " timestamp=" + str(schema_row["timestamp"]))
+            print("DEBUG: schema_row " + str(idx) +
+                  " → model_name=" + schema_row["model_name"] +
+                  " timestamp="    + str(schema_row["timestamp"]))
 
         os.makedirs(os.path.dirname(args.schema_json) or ".", exist_ok=True)
         with open(args.schema_json, "w") as f:
@@ -420,8 +503,14 @@ implementation:
 
         # ── Best hyperparameters ───────────────────────────────────────
         try:
-            best    = katib_client.get_optimal_hyperparameters(name=experiment_name, namespace=namespace)
-            hp_dict = {p.name: auto_cast(p.value) for p in best.parameter_assignments} if best and hasattr(best, "parameter_assignments") else {}
+            best = katib_client.get_optimal_hyperparameters(
+                name=experiment_name, namespace=namespace
+            )
+            hp_dict = (
+                {p.name: auto_cast(p.value) for p in best.parameter_assignments}
+                if best and hasattr(best, "parameter_assignments")
+                else {}
+            )
             print("DEBUG: Best hyperparameters: " + str(hp_dict))
         except Exception as e:
             print("DEBUG: Failed to get best hyperparameters: " + str(e))
@@ -431,7 +520,7 @@ implementation:
         with open(args.best_hyperparams, "w") as f:
             json.dump(hp_dict, f, indent=2)
 
-        print("=== KATIB TUNER V4.5: COMPLETED ===")
+        print("=== KATIB TUNER V5: COMPLETED ===")
 
     args:
       - --config_json
