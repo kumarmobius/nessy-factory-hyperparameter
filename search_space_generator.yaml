@@ -1,4 +1,4 @@
-name: Search Space Generator for Katib V6.1
+name: Search Space Generator for Katib V6.2
 inputs:
   - {name: model_config, type: String}
   - {name: max_n_layers, type: Integer, optional: true, default: "4"}
@@ -229,9 +229,23 @@ implementation:
             if name in SKIP_PARAMS:
                 logger.info("Skipping (excluded): %s", name)
                 return None
-
-            # ── true → use predefined range ───────────────────────── #
-            if is_tune_flag(value):
+        
+            # ── [x] single item list → skip ───────────────────────────── #
+            if isinstance(value, list) and len(value) == 1:
+                logger.info("Skipping (fixed single list): %s = %s", name, value)
+                return None
+        
+            # ── [x, y, z] multiple list → exactly those values ────────── #
+            if isinstance(value, list) and len(value) > 1:
+                return {
+                    "name": name,
+                    "parameter_type": "categorical",
+                    "feasible_space": {"list": [str(v) for v in value]},
+                }
+        
+            # ── scalar value OR true → use predefined range ────────────── #
+            # (scalar is treated as the default/init hint, range comes from lookup tables)
+            if value is not False:
                 if name in DOUBLE_PARAMS:
                     return {"name": name, "parameter_type": "double",
                             "feasible_space": DOUBLE_PARAMS[name]}
@@ -241,24 +255,11 @@ implementation:
                 if name in CATEGORICAL_PARAMS:
                     return {"name": name, "parameter_type": "categorical",
                             "feasible_space": {"list": CATEGORICAL_PARAMS[name]}}
-                logger.warning("No predefined range for '%s' — skipping.", name)
+                logger.warning("No predefined range for '%s' (value=%s) — skipping.", name, value)
                 return None
-
-            # ── [x] single value → fixed, skip ───────────────────── #
-            if isinstance(value, list) and len(value) == 1:
-                logger.info("Skipping (fixed single value): %s = %s", name, value)
-                return None
-
-            # ── [x, y, z] → categorical with exactly those values ─── #
-            if is_user_list(value):
-                return {
-                    "name": name,
-                    "parameter_type": "categorical",
-                    "feasible_space": {"list": [str(v) for v in value]},
-                }
-
-            # ── raw scalar → fixed, skip ──────────────────────────── #
-            logger.info("Skipping (fixed scalar): %s = %s", name, value)
+        
+            # ── false → skip ───────────────────────────────────────────── #
+            logger.info("Skipping (false): %s", name)
             return None
 
         # ── Parse config ───────────────────────────────────────────────
