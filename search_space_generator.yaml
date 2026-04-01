@@ -1,4 +1,4 @@
-name: Search Space Generator for Katib V6
+name: Search Space Generator for Katib V6.1
 inputs:
   - {name: model_config, type: String}
   - {name: max_n_layers, type: Integer, optional: true, default: "4"}
@@ -8,7 +8,7 @@ outputs:
 
 implementation:
   container:
-    image: 
+    image: kumar2004/katib-test:6
     command:
       - python3
       - -u
